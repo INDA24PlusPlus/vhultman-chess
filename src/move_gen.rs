@@ -1,4 +1,5 @@
 use crate::rank;
+use crate::BitBoard;
 use crate::Board;
 use crate::Color;
 use crate::PieceMove;
@@ -15,9 +16,9 @@ impl Board {
     }
 
     fn get_pawns_move_mask(&self) -> u64 {
-        let all_pieces = self.state.piece_mask().0;
-        let pawn_mask = self.state.pieces[PieceType::Pawn as usize].0;
-        let piece_mask = pawn_mask & self.state.color[self.current_turn as usize].0;
+        let all_pieces = self.state.piece_mask();
+        let pawn_mask = self.state.pieces[PieceType::Pawn as usize];
+        let piece_mask = pawn_mask & self.state.color[self.current_turn as usize];
 
         if self.current_turn == Color::White {
             let single_push_mask = (piece_mask >> BOARD_SIZE) & !all_pieces;
@@ -33,10 +34,10 @@ impl Board {
     }
 
     fn get_pawn_capture_mask(&self) -> u64 {
-        let pawn_mask = self.state.pieces[PieceType::Pawn as usize].0
-            & self.state.color[self.current_turn as usize].0;
+        let pawn_mask = self.state.pieces[PieceType::Pawn as usize]
+            & self.state.color[self.current_turn as usize];
 
-        let enemy_mask = self.state.color[self.current_turn as usize + 1 & 1].0;
+        let enemy_mask = self.state.color[self.current_turn as usize + 1 & 1];
         const FILE_A: u64 = 0x0101010101010101;
         const FILE_H: u64 = 0x8080808080808080;
 
@@ -60,7 +61,7 @@ impl Board {
     }
 
     fn pawn_moves_from_capture_mask(&mut self, mut capture_mask: u64) {
-        let piece_mask = self.state.pieces[PieceType::Pawn as usize].0;
+        let piece_mask = self.state.pieces[PieceType::Pawn as usize];
 
         // NOTE: I am lazy so screw code deduplication.
         if self.current_turn == Color::White {
@@ -115,7 +116,7 @@ impl Board {
     }
 
     fn pawn_moves_from_move_mask(&mut self, mut move_mask: u64) {
-        let piece_mask = self.state.pieces[PieceType::Pawn as usize].0;
+        let piece_mask = self.state.pieces[PieceType::Pawn as usize];
         while move_mask != 0 {
             let pos = move_mask.trailing_zeros();
 

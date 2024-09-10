@@ -169,17 +169,17 @@ impl Board {
         let index = m.start as usize;
         let piece = &self.pieces[index].unwrap();
 
-        let capture_mask = (1 << m.target) & self.state.piece_mask().0;
-        self.state.color[self.current_turn as usize + 1 & 1].0 ^= capture_mask;
+        let capture_mask = (1 << m.target) & self.state.piece_mask();
+        self.state.color[self.current_turn as usize + 1 & 1] ^= capture_mask;
 
         let mask = !(1 << index);
-        self.state.pieces[piece.t as usize].0 &= mask;
-        self.state.color[piece.color as usize].0 &= mask;
+        self.state.pieces[piece.t as usize] &= mask;
+        self.state.color[piece.color as usize] &= mask;
 
         let index = m.target as usize;
         let new_location = 1 << index;
-        self.state.pieces[piece.t as usize].0 |= new_location;
-        self.state.color[piece.color as usize].0 |= new_location;
+        self.state.pieces[piece.t as usize] |= new_location;
+        self.state.color[piece.color as usize] |= new_location;
 
         self.next_player();
 
@@ -210,15 +210,15 @@ impl Board {
     /// Updates the public api facing pieces to reflect the actual state of the board.
     fn recalculate_pieces_from_state(&mut self) {
         self.pieces = [None; 64];
-        let mut piece_mask = self.state.piece_mask().0;
+        let mut piece_mask = self.state.piece_mask();
 
         while piece_mask != 0 {
             let pos = piece_mask.trailing_zeros();
-            let curr_square = BitBoard(1 << pos);
+            let curr_square = 1 << pos;
 
             // We know there exists a piece here cause of the trailing zero count.
             let piece_type = self.state.piece_type(curr_square).unwrap();
-            let is_white = curr_square.0 & self.state.color[0].0 != 0;
+            let is_white = curr_square & self.state.color[0] != 0;
 
             self.pieces[pos as usize] = Some(Piece {
                 pos,
@@ -240,29 +240,29 @@ struct BoardState {
 impl BoardState {
     fn new() -> BoardState {
         BoardState {
-            color: [BitBoard(0); 2],
-            pieces: [BitBoard(0); 6],
+            color: [0; 2],
+            pieces: [0; 6],
         }
     }
 
     fn piece_mask(&self) -> BitBoard {
         let mut mask: u64 = 0;
         for piece in self.pieces {
-            mask |= piece.0;
+            mask |= piece;
         }
 
-        BitBoard(mask)
+        mask
     }
 
     fn piece_type(&self, square: BitBoard) -> Option<PieceType> {
-        let square = u64x8::splat(square.0);
+        let square = u64x8::splat(square);
         let boards = u64x8::from_array([
-            self.pieces[0].0,
-            self.pieces[1].0,
-            self.pieces[2].0,
-            self.pieces[3].0,
-            self.pieces[4].0,
-            self.pieces[5].0,
+            self.pieces[0],
+            self.pieces[1],
+            self.pieces[2],
+            self.pieces[3],
+            self.pieces[4],
+            self.pieces[5],
             0,
             0,
         ]);
@@ -275,31 +275,6 @@ impl BoardState {
             Some(PieceType::from_usize(index))
         } else {
             None
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct BitBoard(u64);
-
-impl BitBoard {
-    fn set(&mut self, x: u32, y: u32) {
-        self.0 |= 1 << (y * BOARD_SIZE + x);
-    }
-
-    #[allow(unused)]
-    fn print(&self) {
-        for y in 0..8 {
-            for x in 0..8 {
-                let is_set = self.0 & 1 << (y * 8 + x) != 0;
-                if is_set {
-                    print!("1");
-                } else {
-                    print!("0");
-                }
-            }
-
-            println!("");
         }
     }
 }
@@ -320,4 +295,33 @@ impl PieceType {
 
 const fn rank(index: u32) -> u64 {
     0xff << (BOARD_SIZE * index)
+}
+
+type BitBoard = u64;
+
+trait BitBoardExtensions {
+    fn print(&self);
+    fn set(&mut self, x: u32, y: u32);
+}
+
+impl BitBoardExtensions for BitBoard {
+    fn set(&mut self, x: u32, y: u32) {
+        *self |= 1 << (y * BOARD_SIZE + x);
+    }
+
+    #[allow(unused)]
+    fn print(&self) {
+        for y in 0..8 {
+            for x in 0..8 {
+                let is_set = self & 1 << (y * 8 + x) != 0;
+                if is_set {
+                    print!("1");
+                } else {
+                    print!("0");
+                }
+            }
+
+            println!("");
+        }
+    }
 }
