@@ -5,8 +5,9 @@ use std::simd::u64x8;
 mod move_gen;
 
 const BOARD_SIZE: u32 = 8;
+const SQUARE_COUNT: usize = 64;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum PieceType {
     Pawn = 0,
     Knight = 1,
@@ -27,7 +28,6 @@ pub struct Piece {
     pub pos: u32,
     pub t: PieceType,
     pub color: Color,
-    _private: (),
 }
 
 #[derive(Clone, Copy)]
@@ -45,6 +45,9 @@ pub struct Board {
     pieces: [Option<Piece>; 8 * 8],
 
     pub moves: Vec<PieceMove>,
+
+    prev_move: PieceMove,
+    prev_piece: Piece,
 }
 
 impl Board {
@@ -128,7 +131,11 @@ impl Board {
 
                     continue;
                 }
-                _ => return Err(format!("Unknown Erorr encountred!")),
+                _ => {
+                    return Err(format!(
+                        "Unknown character encountred! Not the entirety of FEM is supported"
+                    ))
+                }
             }
 
             x += 1;
@@ -139,7 +146,17 @@ impl Board {
             state: board,
             pieces: [None; 64],
             moves: Vec::new(),
+            prev_move: PieceMove {
+                start: 0,
+                target: 0,
+            },
+            prev_piece: Piece {
+                pos: 0,
+                t: PieceType::Pawn,
+                color: Color::White,
+            },
         };
+
         board.recalculate_pieces_from_state();
         board.gen_moves();
 
@@ -154,8 +171,13 @@ impl Board {
         self.current_turn
     }
 
+    /// Tries to make the specified move.
+    /// return:
+    ///     (false, false): move was not valid and therefore not made.
+    ///     (true, false): move was made, but no capture occured.
+    ///     (true, true): move was made and capture occured.
     pub fn make_move(&mut self, m: PieceMove) -> (bool, bool) {
-        // Linear search is good enough since move < 220
+        // Linear search is good enough since moves.len < 220
         let is_valid = self
             .moves
             .iter()
@@ -166,24 +188,81 @@ impl Board {
             return (false, false);
         }
 
-        let index = m.start as usize;
-        let piece = &self.pieces[index].unwrap();
+        let start_square = m.start as usize;
+        let moving_piece = self.pieces[start_square].unwrap();
+        let target_piece = self.pieces[m.target as usize];
 
-        let capture_mask = (1 << m.target) & self.state.piece_mask();
-        self.state.color[self.current_turn as usize + 1 & 1] ^= capture_mask;
+        let did_en_passant_capture = self.handle_en_passant(m, &moving_piece, &target_piece);
 
-        let mask = !(1 << index);
-        self.state.pieces[piece.t as usize] &= mask;
-        self.state.color[piece.color as usize] &= mask;
+        // BitBoard representing any captures.
+        let capture = (1 << m.target) & self.state.piece_mask();
 
-        let index = m.target as usize;
-        let new_location = 1 << index;
-        self.state.pieces[piece.t as usize] |= new_location;
-        self.state.color[piece.color as usize] |= new_location;
+        // Unset opposite side if there was a capture.
+        self.state.color[self.current_turn as usize + 1 & 1] &= !capture;
+
+        // if there was a capture unset correct bit in piece masks
+        if let Some(target) = target_piece {
+            self.state.pieces[target.t as usize] &= !capture;
+        }
+
+        // Unset the previous position of the piece
+        let mask = !(1 << start_square);
+        self.state.pieces[moving_piece.t as usize] &= mask;
+        self.state.color[moving_piece.color as usize] &= mask;
+
+        // Set the new location on the boards.
+        let target_square = m.target as usize;
+        let new_location = 1 << target_square;
+        self.state.pieces[moving_piece.t as usize] |= new_location;
+        self.state.color[moving_piece.color as usize] |= new_location;
+
+        // Needed for en passant move gen.
+        self.prev_move = m;
+        self.prev_piece = moving_piece;
+        self.prev_piece.pos = m.target;
 
         self.next_player();
 
-        (true, capture_mask != 0)
+        (true, capture != 0 || did_en_passant_capture)
+    }
+
+    /// Checks if en passant occured and handles
+    /// state updating.
+    /// returns true if en passant happened.
+    fn handle_en_passant(
+        &mut self,
+        m: PieceMove,
+        moving_piece: &Piece,
+        target_piece: &Option<Piece>,
+    ) -> bool {
+        let is_en_passant = Self::is_move_en_passant(m, moving_piece, &target_piece);
+        if is_en_passant {
+            let capture_square = if self.current_turn == Color::White {
+                1 << (m.target as u64 + 8)
+            } else {
+                1 << (m.target as u64 - 8)
+            };
+
+            let mask = !capture_square;
+            self.state.pieces[PieceType::Pawn as usize] &= mask;
+            *self.enemy_color_mask() &= mask;
+            return true;
+        };
+
+        false
+    }
+
+    fn is_move_en_passant(
+        m: PieceMove,
+        moving_piece: &Piece,
+        target_piece: &Option<Piece>,
+    ) -> bool {
+        if target_piece.is_none() && moving_piece.t == PieceType::Pawn {
+            let move_dist = (m.start as i32 - m.target as i32).abs();
+            return move_dist == 7 || move_dist == 9;
+        }
+
+        false
     }
 
     /// Prepares the board state for next player's turn.
@@ -192,11 +271,6 @@ impl Board {
         self.change_turn_color();
         self.gen_moves();
         self.recalculate_pieces_from_state();
-    }
-
-    /// Populates 'moves' field with current legal moves based upon board state.
-    fn gen_moves(&mut self) {
-        self.get_pawn_moves();
     }
 
     /// Updates 'current_color' bit board to correct color bit board.
@@ -213,7 +287,7 @@ impl Board {
         let mut piece_mask = self.state.piece_mask();
 
         while piece_mask != 0 {
-            let pos = piece_mask.trailing_zeros();
+            let pos = piece_mask.trailing_zeroes_with_reset();
             let curr_square = 1 << pos;
 
             // We know there exists a piece here cause of the trailing zero count.
@@ -224,11 +298,12 @@ impl Board {
                 pos,
                 color: if is_white { Color::White } else { Color::Black },
                 t: piece_type,
-                _private: (),
             });
-
-            piece_mask ^= 1 << pos;
         }
+    }
+
+    fn enemy_color_mask(&mut self) -> &mut BitBoard {
+        &mut self.state.color[(self.current_turn as usize + 1) & 1]
     }
 }
 
@@ -246,14 +321,10 @@ impl BoardState {
     }
 
     fn piece_mask(&self) -> BitBoard {
-        let mut mask: u64 = 0;
-        for piece in self.pieces {
-            mask |= piece;
-        }
-
-        mask
+        self.color[0] | self.color[1]
     }
 
+    // TODO: Make this work on Rust stable.
     fn piece_type(&self, square: BitBoard) -> Option<PieceType> {
         let square = u64x8::splat(square);
         let boards = u64x8::from_array([
@@ -297,11 +368,26 @@ const fn rank(index: u32) -> u64 {
     0xff << (BOARD_SIZE * index)
 }
 
+trait BoolMaskTrait {
+    fn as_mask(self) -> BitBoard;
+}
+
+impl BoolMaskTrait for bool {
+    /// Returns a mask of all 1's for true and all 0's for false.
+    fn as_mask(self) -> BitBoard {
+        -(self as i64) as u64
+    }
+}
+
 type BitBoard = u64;
 
 trait BitBoardExtensions {
+    #[allow(unused)]
     fn print(&self);
+
     fn set(&mut self, x: u32, y: u32);
+    fn bit_scan(self, forward: bool) -> u32;
+    fn trailing_zeroes_with_reset(&mut self) -> u32;
 }
 
 impl BitBoardExtensions for BitBoard {
@@ -309,7 +395,24 @@ impl BitBoardExtensions for BitBoard {
         *self |= 1 << (y * BOARD_SIZE + x);
     }
 
+    // "borrowed" from
+    // https://www.chessprogramming.org/BitScan#GeneralizedBitscan
+    fn bit_scan(mut self, reverse: bool) -> u32 {
+        let r_mask = reverse.as_mask();
+        self &= self.wrapping_neg() | r_mask;
+        self.leading_zeros()
+    }
+
+    // https://www.chessprogramming.org/BitScan#Bitscan_with_Reset
+    /// Returns position of the most significant bit and unsets it.
+    fn trailing_zeroes_with_reset(&mut self) -> u32 {
+        let pos = self.trailing_zeros();
+        *self &= *self - 1;
+        pos
+    }
+
     #[allow(unused)]
+    /// Only for debugging.
     fn print(&self) {
         for y in 0..8 {
             for x in 0..8 {
