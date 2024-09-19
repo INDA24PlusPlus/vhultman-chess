@@ -1,5 +1,4 @@
 #![feature(portable_simd)]
-use std::fmt;
 use std::simd::cmp::SimdPartialEq;
 use std::simd::u64x8;
 
@@ -27,47 +26,6 @@ pub enum PieceType {
     Rook,
     Queen,
     King,
-}
-
-impl fmt::Display for Piece {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let symbol = match (self.t, self.color) {
-            (PieceType::Pawn, Color::White) => "♙",
-            (PieceType::Knight, Color::White) => "♘",
-            (PieceType::Bishop, Color::White) => "♗",
-            (PieceType::Rook, Color::White) => "♖",
-            (PieceType::Queen, Color::White) => "♕",
-            (PieceType::King, Color::White) => "♔",
-            (PieceType::Pawn, Color::Black) => "♟",
-            (PieceType::Knight, Color::Black) => "♞",
-            (PieceType::Bishop, Color::Black) => "♝",
-            (PieceType::Rook, Color::Black) => "♜",
-            (PieceType::Queen, Color::Black) => "♛",
-            (PieceType::King, Color::Black) => "♚",
-        };
-        write!(f, "{}", symbol)
-    }
-}
-
-pub fn print_board(board: &[Option<Piece>; 64]) {
-    println!("  a b c d e f g h");
-    println!(" ┌───────────────┐");
-    for rank in (0..8).rev() {
-        print!("{}│", rank + 1);
-        for file in 0..8 {
-            let index = rank * 8 + file;
-            match &board[index] {
-                Some(piece) => print!("{}│", piece),
-                None => print!(" │"),
-            }
-        }
-        println!(" {}", rank + 1);
-        if rank > 0 {
-            println!(" ├───────────────┤");
-        }
-    }
-    println!(" └───────────────┘");
-    println!("  a b c d e f g h");
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -130,22 +88,6 @@ impl Position {
 
         let maybe_capture = self.piece_type(1 << to);
         self.state.captured_p = maybe_capture;
-
-        if self.state.captured_p == Some(PieceType::King) {
-            println!("{:?}", piece_type);
-            println!("{}:{}", to, from);
-            println!("Our side {:?}", self.current_side);
-            println!("We captued {:?} king", self.piece_color(to));
-
-            println!("was promo: {:?}", self.state.m.is_promotion());
-            println!("Checkers:");
-            self.state.checkers[self.opposite_side() as usize].print();
-
-            println!("Pinned?:");
-            self.state.king_blockers[self.opposite_side() as usize].print();
-
-            print_board(&self.board);
-        }
 
         if let Some(p) = maybe_capture {
             self.state.pieces[p as usize] &= !(1 << to);
