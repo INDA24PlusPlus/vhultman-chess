@@ -1,25 +1,67 @@
 use crate::*;
 
-pub(crate) fn generate_pseudo_legal(pos: &Position, moves: &mut Vec<ChessMove>) {
-    generate_rook_moves(pos, moves);
-    generate_bishop_moves(pos, moves);
-    generate_knight_moves(pos, moves);
+pub(crate) fn generate_pseudo_legal(pos: &mut Position, moves: &mut Vec<ChessMove>) {
+    let checkers_mask = pos.state.checkers[pos.opposite_side() as usize];
+    let checkers_count = checkers_mask.count_ones();
 
-    let en_passant_mask = pos.en_passant_possible().as_mask() & (1 << pos.state.m.to());
+    let king_square = pos.king(pos.current_side).trailing_zeros();
 
-    if pos.current_side == Color::White {
-        generate_pawn_moves::<true>(pos, moves, en_passant_mask);
+    // if there is a checker then the only moves we can make must
+    // end between the king and the checker (including the checker)
+    let movable_squares = if checkers_count == 1 {
+        let mut bb = between_bb(
+            king_square as usize,
+            checkers_mask.trailing_zeros() as usize,
+        );
+
+        // handle Knight check
+        bb |= checkers_mask;
+
+        bb
     } else {
-        generate_pawn_moves::<false>(pos, moves, en_passant_mask);
+        true.as_mask()
+    };
+
+    // If there are more than 2 checkers the only possible moves will be king moves.
+    if checkers_count < 2 {
+        generate_rook_moves(pos, moves, movable_squares);
+        generate_bishop_moves(pos, moves, movable_squares);
+        generate_knight_moves(pos, moves, movable_squares);
+        gen_pinned_queen_moves(pos, moves, movable_squares);
+
+        let en_passant_mask = pos.en_passant_possible().as_mask() & (1 << pos.state.m.to());
+
+        if pos.current_side == Color::White {
+            generate_pawn_moves::<true>(pos, moves, en_passant_mask, movable_squares);
+        } else {
+            generate_pawn_moves::<false>(pos, moves, en_passant_mask, movable_squares);
+        }
     }
 
     let threat_mask = compute_threat_mask(pos, pos.opposite_side());
     generate_king_moves(pos, moves, !threat_mask);
 }
 
-fn generate_king_moves(pos: &Position, moves: &mut Vec<ChessMove>, movable_squares: BitBoard) {
+fn generate_king_moves(pos: &Position, moves: &mut Vec<ChessMove>, mut movable_squares: BitBoard) {
     let king = pos.king(pos.current_side);
     let king_square = king.trailing_zeros();
+
+    // Gen updated threat mask for snipers with only friendly blockers.
+    let ec = pos.opposite_side();
+    let blockers = pos.all() ^ king;
+    let mut rook_checkers = pos.state.checkers[ec as usize] & (pos.rooks(ec) | pos.queen(ec));
+
+    while rook_checkers != 0 {
+        let rook_square = rook_checkers.trailing_zeroes_with_reset();
+        movable_squares &= !(attack_mask_rook(rook_square, blockers));
+    }
+
+    let mut bishop_checkers = pos.state.checkers[ec as usize] & (pos.bishops(ec) | pos.queen(ec));
+
+    while bishop_checkers != 0 {
+        let bishop_square = bishop_checkers.trailing_zeroes_with_reset();
+        movable_squares &= !(attack_mask_bishop(bishop_square, blockers));
+    }
 
     let mut move_mask = LUT::KING[king_square as usize];
     move_mask &= !pos.color_mask(pos.current_side);
@@ -75,7 +117,7 @@ fn gen_castling_moves(pos: &Position, moves: &mut Vec<ChessMove>, movable_square
     let c = pos.current_side as usize;
 
     // Cannot castle if we are in check
-    if pos.generate_checkers_mask().count_ones() != 0 {
+    if pos.state.checkers[pos.opposite_side() as usize] != 0 {
         return;
     }
 
@@ -138,13 +180,14 @@ fn gen_castling_moves(pos: &Position, moves: &mut Vec<ChessMove>, movable_square
     }
 }
 
-fn generate_knight_moves(pos: &Position, moves: &mut Vec<ChessMove>) {
-    let mut knights = pos.knights(pos.current_side);
+fn generate_knight_moves(pos: &Position, moves: &mut Vec<ChessMove>, movable_squares: BitBoard) {
+    let mut knights = pos.knights(pos.current_side) & !pos.pinned(pos.current_side);
 
     while knights != 0 {
         let from = knights.trailing_zeroes_with_reset();
         let mut attacks = LUT::KNIGHT[from as usize];
         attacks &= !pos.color_mask(pos.current_side);
+        attacks &= movable_squares;
 
         while attacks != 0 {
             let to = attacks.trailing_zeroes_with_reset();
@@ -154,11 +197,12 @@ fn generate_knight_moves(pos: &Position, moves: &mut Vec<ChessMove>) {
 }
 
 fn generate_pawn_moves<const WHITE: bool>(
-    pos: &Position,
+    pos: &mut Position,
     moves: &mut Vec<ChessMove>,
     en_passant_mask: BitBoard,
+    movable_squares: BitBoard,
 ) {
-    let mut pawns = pos.pawns(pos.current_side);
+    let mut pawns = pos.pawns(pos.current_side) & !pos.pinned(pos.current_side);
     let occupied = pos.all();
 
     let double_push_rank = if WHITE { rank(5) } else { rank(2) };
@@ -188,6 +232,7 @@ fn generate_pawn_moves<const WHITE: bool>(
         let normal_captures = (right_captures | left_captures) & occupied;
         move_mask |= normal_captures;
         move_mask &= !pos.color_mask(pos.current_side);
+        move_mask &= movable_squares;
 
         // Handle promotions.
         let mut promotion_moves = move_mask & promotion_rank;
@@ -212,10 +257,59 @@ fn generate_pawn_moves<const WHITE: bool>(
 
         let en_passant_targets = (en_passant_left | en_passant_right) & en_passant_rank;
         let mut en_passant_moves = shift::<WHITE>(en_passant_targets, 8) & !occupied;
+        en_passant_moves &= movable_squares;
 
         if en_passant_moves != 0 {
+            // To handle en passant discovery check we just play the move and check if the king is in check.
             let to = en_passant_moves.trailing_zeroes_with_reset();
-            moves.push(ChessMove::new(from, to, ChessMove::FLAG_EN_PASSANT));
+            let m = ChessMove::new(from, to, ChessMove::FLAG_EN_PASSANT);
+            pos.make_move(m);
+
+            // Other side now so we check if we have any checkers.
+            if pos.state.checkers[pos.current_side as usize] == 0 {
+                moves.push(m);
+            }
+
+            pos.undo_move(m);
+        }
+    }
+
+    // handle pinned pawns.
+    let mut pinned_pawns = pos.pawns(pos.current_side) & pos.pinned(pos.current_side);
+    let pinners = pos.state.pinners[pos.opposite_side() as usize];
+    let king_square = pos.king(pos.current_side).trailing_zeros();
+
+    while pinned_pawns != 0 {
+        let mut pinners = pinners;
+        let pawn_square = pinned_pawns.trailing_zeroes_with_reset();
+        let pawn_bb = 1 << pawn_square;
+
+        // single push
+        let mut move_mask = shift::<WHITE>(pawn_bb, 8) & !occupied;
+
+        // double pushes
+        move_mask |= shift::<WHITE>(move_mask & double_push_rank, 8) & !occupied;
+
+        // Handle captures
+        let right_captures = shift::<WHITE>(pawn_bb, right_capture_shift) & NOT_FILE_A;
+        let left_captures = shift::<WHITE>(pawn_bb, left_capture_shift) & NOT_FILE_H;
+
+        let normal_captures = (right_captures | left_captures) & occupied;
+        move_mask |= normal_captures;
+        move_mask &= !pos.color_mask(pos.current_side);
+        move_mask &= movable_squares;
+
+        while pinners != 0 {
+            let pinner_square = pinners.trailing_zeroes_with_reset();
+            let mut between = between_bb(king_square as usize, pinner_square as usize);
+            between &= (between & (1 << pawn_square) != 0).as_mask();
+
+            let mut actual_move_mask = between & move_mask;
+
+            while actual_move_mask != 0 {
+                let to = actual_move_mask.trailing_zeroes_with_reset();
+                moves.push(ChessMove::new(pawn_square, to, 0));
+            }
         }
     }
 }
@@ -228,8 +322,38 @@ fn shift<const RIGHT: bool>(v: BitBoard, shift: u32) -> BitBoard {
     }
 }
 
-fn generate_bishop_moves(pos: &Position, moves: &mut Vec<ChessMove>) {
-    let mut bishops = pos.bishops(pos.current_side) | pos.queen(pos.current_side);
+fn gen_pinned_queen_moves(pos: &Position, moves: &mut Vec<ChessMove>, movable_squares: BitBoard) {
+    let mut pinned_queens = pos.queen(pos.current_side) & pos.pinned(pos.current_side);
+    let pinners = pos.state.pinners[pos.opposite_side() as usize];
+    let occupied = pos.all();
+    let king_square = pos.king(pos.current_side).trailing_zeros();
+
+    while pinned_queens != 0 {
+        let mut pinners = pinners;
+        let sq0 = pinned_queens.trailing_zeroes_with_reset();
+        while pinners != 0 {
+            let pinner_sq = pinners.trailing_zeroes_with_reset();
+            let mut bb = between_bb(king_square as usize, pinner_sq as usize);
+            bb &= movable_squares;
+            bb &= (bb & (1 << sq0) != 0).as_mask();
+            bb &= attack_mask_rook(sq0, occupied) | attack_mask_bishop(sq0, occupied);
+
+            while bb != 0 {
+                let to = bb.trailing_zeroes_with_reset();
+                moves.push(ChessMove::new(sq0, to, 0));
+            }
+        }
+    }
+}
+
+fn generate_bishop_moves(
+    pos: &mut Position,
+    moves: &mut Vec<ChessMove>,
+    movable_squares: BitBoard,
+) {
+    let mut bishops = (pos.bishops(pos.current_side) | pos.queen(pos.current_side))
+        & !pos.pinned(pos.current_side);
+
     let occupied = pos.all();
 
     while bishops != 0 {
@@ -237,16 +361,41 @@ fn generate_bishop_moves(pos: &Position, moves: &mut Vec<ChessMove>) {
 
         let mut attacks = attack_mask_bishop(from, occupied);
         attacks &= !pos.color_mask(pos.current_side);
+        attacks &= movable_squares;
+        attacks &= !pos.king(pos.opposite_side());
 
         while attacks != 0 {
             let to = attacks.trailing_zeroes_with_reset();
             moves.push(ChessMove::new(from, to, 0));
         }
     }
+
+    let mut pinned_bishops = pos.bishops(pos.current_side) & pos.pinned(pos.current_side);
+    let pinners = pos.state.pinners[pos.opposite_side() as usize];
+    let king_square = pos.king(pos.current_side).trailing_zeros();
+
+    while pinned_bishops != 0 {
+        let mut pinners = pinners;
+        let sq0 = pinned_bishops.trailing_zeroes_with_reset();
+        while pinners != 0 {
+            let pinner_sq = pinners.trailing_zeroes_with_reset();
+            let mut bb = between_bb(king_square as usize, pinner_sq as usize);
+            bb &= (bb & (1 << sq0) != 0).as_mask();
+            bb &= movable_squares;
+            bb &= attack_mask_bishop(sq0, 0);
+
+            while bb != 0 {
+                let to = bb.trailing_zeroes_with_reset();
+                moves.push(ChessMove::new(sq0, to, 0));
+            }
+        }
+    }
 }
 
-fn generate_rook_moves(pos: &Position, moves: &mut Vec<ChessMove>) {
-    let mut rooks = pos.rooks(pos.current_side) | pos.queen(pos.current_side);
+fn generate_rook_moves(pos: &Position, moves: &mut Vec<ChessMove>, movable_squares: BitBoard) {
+    let mut rooks =
+        (pos.rooks(pos.current_side) | pos.queen(pos.current_side)) & !pos.pinned(pos.current_side);
+
     let occupied = pos.all();
 
     while rooks != 0 {
@@ -254,10 +403,34 @@ fn generate_rook_moves(pos: &Position, moves: &mut Vec<ChessMove>) {
 
         let mut attacks = attack_mask_rook(from, occupied);
         attacks &= !pos.color_mask(pos.current_side);
+        attacks &= movable_squares;
 
         while attacks != 0 {
             let to = attacks.trailing_zeroes_with_reset();
             moves.push(ChessMove::new(from, to, 0));
+        }
+    }
+
+    let mut pinned_rooks = (pos.rooks(pos.current_side)) & pos.pinned(pos.current_side);
+    let pinners = pos.state.pinners[pos.opposite_side() as usize];
+    let king_square = pos.king(pos.current_side).trailing_zeros();
+
+    while pinned_rooks != 0 {
+        let mut pinners = pinners;
+        let sq0 = pinned_rooks.trailing_zeroes_with_reset();
+        while pinners != 0 {
+            let pinner_sq = pinners.trailing_zeroes_with_reset();
+            let mut bb = between_bb(king_square as usize, pinner_sq as usize);
+            bb &= movable_squares;
+            bb &= (bb & (1 << sq0) != 0).as_mask();
+            bb &= attack_mask_rook(sq0, 0);
+
+            if bb != 0 && bb & pos.king(pos.current_side) == 0 {
+                while bb != 0 {
+                    let to = bb.trailing_zeroes_with_reset();
+                    moves.push(ChessMove::new(sq0, to, 0));
+                }
+            }
         }
     }
 }

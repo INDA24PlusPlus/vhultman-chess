@@ -1,4 +1,5 @@
 #![feature(portable_simd)]
+use std::fmt;
 use std::simd::cmp::SimdPartialEq;
 use std::simd::u64x8;
 
@@ -26,6 +27,47 @@ pub enum PieceType {
     Rook,
     Queen,
     King,
+}
+
+impl fmt::Display for Piece {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let symbol = match (self.t, self.color) {
+            (PieceType::Pawn, Color::White) => "♙",
+            (PieceType::Knight, Color::White) => "♘",
+            (PieceType::Bishop, Color::White) => "♗",
+            (PieceType::Rook, Color::White) => "♖",
+            (PieceType::Queen, Color::White) => "♕",
+            (PieceType::King, Color::White) => "♔",
+            (PieceType::Pawn, Color::Black) => "♟",
+            (PieceType::Knight, Color::Black) => "♞",
+            (PieceType::Bishop, Color::Black) => "♝",
+            (PieceType::Rook, Color::Black) => "♜",
+            (PieceType::Queen, Color::Black) => "♛",
+            (PieceType::King, Color::Black) => "♚",
+        };
+        write!(f, "{}", symbol)
+    }
+}
+
+pub fn print_board(board: &[Option<Piece>; 64]) {
+    println!("  a b c d e f g h");
+    println!(" ┌───────────────┐");
+    for rank in (0..8).rev() {
+        print!("{}│", rank + 1);
+        for file in 0..8 {
+            let index = rank * 8 + file;
+            match &board[index] {
+                Some(piece) => print!("{}│", piece),
+                None => print!(" │"),
+            }
+        }
+        println!(" {}", rank + 1);
+        if rank > 0 {
+            println!(" ├───────────────┤");
+        }
+    }
+    println!(" └───────────────┘");
+    println!("  a b c d e f g h");
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -64,6 +106,7 @@ struct State {
 
     king_blockers: [BitBoard; NUM_COLORS],
     pinners: [BitBoard; NUM_COLORS],
+    checkers: [BitBoard; NUM_COLORS],
 }
 
 impl Position {
@@ -87,6 +130,23 @@ impl Position {
 
         let maybe_capture = self.piece_type(1 << to);
         self.state.captured_p = maybe_capture;
+
+        if self.state.captured_p == Some(PieceType::King) {
+            println!("{:?}", piece_type);
+            println!("{}:{}", to, from);
+            println!("Our side {:?}", self.current_side);
+            println!("We captued {:?} king", self.piece_color(to));
+
+            println!("was promo: {:?}", self.state.m.is_promotion());
+            println!("Checkers:");
+            self.state.checkers[self.opposite_side() as usize].print();
+
+            println!("Pinned?:");
+            self.state.king_blockers[self.opposite_side() as usize].print();
+
+            print_board(&self.board);
+        }
+
         if let Some(p) = maybe_capture {
             self.state.pieces[p as usize] &= !(1 << to);
             self.state.colors[self.piece_color(to) as usize] &= !(1 << to);
@@ -122,6 +182,8 @@ impl Position {
         self.state.colors[color_idx] |= 1 << to;
 
         self.switch_side();
+        self.generate_pin_data(self.current_side);
+        self.state.checkers[self.opposite_side() as usize] = self.generate_checkers_mask();
     }
 
     pub fn undo_move(&mut self, m: ChessMove) {
@@ -130,36 +192,7 @@ impl Position {
     }
 
     pub fn generate_moves(&mut self, moves: &mut Vec<ChessMove>) {
-        let start_pieces = self.state.pieces;
-        let start_colors = self.state.colors;
-
         generate_pseudo_legal(self, moves);
-
-        let mut legal_moves = Vec::new();
-        legal_moves.reserve(256);
-
-        let mut responses = Vec::new();
-        responses.reserve(256);
-
-        for m in moves.iter() {
-            self.make_move(*m);
-            let king_square = self.king(self.opposite_side()).trailing_zeros();
-
-            responses.truncate(0);
-            generate_pseudo_legal(self, &mut responses);
-
-            if !responses.iter().any(|r| r.to() == king_square) {
-                legal_moves.push(*m);
-            }
-
-            self.undo_move(*m);
-        }
-
-        moves.truncate(0);
-        *moves = legal_moves;
-
-        self.state.colors = start_colors;
-        self.state.pieces = start_pieces;
     }
 
     pub fn from_fen(fen_string: &str) -> Result<Position, String> {
@@ -231,6 +264,7 @@ impl Position {
             captured_p: None,
             pinners: [0; NUM_COLORS],
             king_blockers: [0; NUM_COLORS],
+            checkers: [0; NUM_COLORS],
         };
 
         Ok(Position {
@@ -327,10 +361,12 @@ impl Position {
         }
     }
 
-    fn generate_pin_data(&mut self, c: Color) {
-        let king_bb = self.king(c);
+    /// Generates what pieces block and pin relevant colors pin.
+    fn generate_pin_data(&mut self, color: Color) {
+        let king_bb = self.king(color);
         let king_square = king_bb.trailing_zeros();
-        let c = c as usize;
+
+        let c = color as usize;
         let ec = (c + 1) & 1;
 
         self.state.king_blockers[c] = 0;
@@ -346,10 +382,9 @@ impl Position {
         let diag = attack_mask_bishop(king_square, 0);
         let mut possible_snipers = ((ortho & rooks) | (diag & bishops)) & self.state.colors[ec];
 
-        let occupied = self.all() ^ possible_snipers;
-
         while possible_snipers != 0 {
             let pos = possible_snipers.trailing_zeroes_with_reset();
+            let occupied = self.all() ^ (1 << pos);
             let bb = between_bb(king_square as usize, pos as usize) & occupied;
 
             if bb.count_ones() == 1 {
@@ -361,6 +396,7 @@ impl Position {
         }
     }
 
+    /// Generates a mask of what pieces give check to current side's king
     fn generate_checkers_mask(&self) -> BitBoard {
         let c = self.opposite_side();
         let king = self.king(self.current_side);
@@ -392,6 +428,10 @@ impl Position {
         };
 
         bishop_checkers | rook_checkers | knight_checkers | pawn_checkers
+    }
+
+    fn pinned(&self, c: Color) -> BitBoard {
+        self.state.king_blockers[c as usize]
     }
 
     fn king(&self, c: Color) -> BitBoard {
