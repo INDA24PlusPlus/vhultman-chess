@@ -5,7 +5,6 @@ use std::simd::u64x8;
 mod move_gen;
 
 use move_gen::{attack_mask_bishop, attack_mask_rook, generate_pseudo_legal, LUT};
-use std::fmt;
 
 const NUM_PIECE_TYPES: usize = 6;
 const NUM_SQUARES: usize = 64;
@@ -39,61 +38,11 @@ pub struct Piece {
 pub struct ChessMove(u32);
 
 impl ChessMove {
-    const FLAG_EN_PASSANT: u32 = 0b0101;
-
-    const FLAG_QUEEN_PROMO: u32 = 0b1011;
-    const FLAG_ROOK_PROMO: u32 = 0b1010;
-    const FLAG_BISHOP_PROMO: u32 = 0b1001;
-    const FLAG_KNIGHT_PROMO: u32 = 0b1000;
-
-    const FLAG_CASTLE_KING: u32 = 0b0010;
-    const FLAG_CASTLE_QUEEN: u32 = 0b0011;
-
     pub fn new(from: u32, to: u32, flags: u32) -> ChessMove {
         // bits 16-12 (4 bits): flags
         // bits 12-6 (6 bits): from
         // bits 6-0 (6 bits): to
         ChessMove((flags & 0xf) << 12 | ((from & 0x3f) << 6) | (to & 0x3f))
-    }
-
-    pub fn to(self) -> u32 {
-        self.0 & 0x3f
-    }
-
-    pub fn from(self) -> u32 {
-        (self.0 >> 6) & 0x3f
-    }
-
-    fn flags(self) -> u32 {
-        self.0 >> 12
-    }
-
-    fn is_capture(self) -> bool {
-        self.0 & 0b0100 != 0
-    }
-
-    pub fn is_en_passant(self) -> bool {
-        self.flags() == ChessMove::FLAG_EN_PASSANT
-    }
-
-    fn is_promotion(self) -> bool {
-        self.0 & 0b1000_0000_0000_0000 != 0
-    }
-
-    fn is_castle_move(self) -> bool {
-        self.is_castle_king() || self.is_castle_queen()
-    }
-
-    fn is_castle_king(self) -> bool {
-        self.flags() == ChessMove::FLAG_CASTLE_KING
-    }
-
-    fn is_castle_queen(self) -> bool {
-        self.flags() == ChessMove::FLAG_CASTLE_QUEEN
-    }
-
-    fn promotion_piece(self) -> PieceType {
-        unsafe { std::mem::transmute((self.flags() - 7) as u8) }
     }
 }
 
@@ -112,88 +61,14 @@ struct State {
     m: ChessMove,
     p: PieceType,
     captured_p: Option<PieceType>,
+
+    king_blockers: [BitBoard; NUM_COLORS],
+    pinners: [BitBoard; NUM_COLORS],
 }
 
 impl Position {
-    pub fn king(&self, c: Color) -> BitBoard {
-        self.state.pieces[PieceType::King as usize] & self.state.colors[c as usize]
-    }
-
-    fn queen(&self, c: Color) -> BitBoard {
-        self.state.pieces[PieceType::Queen as usize] & self.state.colors[c as usize]
-    }
-
-    fn rooks(&self, c: Color) -> BitBoard {
-        self.state.pieces[PieceType::Rook as usize] & self.state.colors[c as usize]
-    }
-
-    fn bishops(&self, c: Color) -> BitBoard {
-        self.state.pieces[PieceType::Bishop as usize] & self.state.colors[c as usize]
-    }
-
-    fn knights(&self, c: Color) -> BitBoard {
-        self.state.pieces[PieceType::Knight as usize] & self.state.colors[c as usize]
-    }
-
-    fn pawns(&self, c: Color) -> BitBoard {
-        self.state.pieces[PieceType::Pawn as usize] & self.state.colors[c as usize]
-    }
-
-    fn all(&self) -> BitBoard {
-        self.state.colors[0] | self.state.colors[1]
-    }
-
-    fn color_mask(&self, c: Color) -> BitBoard {
-        self.state.colors[c as usize]
-    }
-
-    fn switch_side(&mut self) {
-        self.current_side = unsafe { std::mem::transmute((self.current_side as u8 + 1) & 1) }
-    }
-
-    fn opposite_side(&self) -> Color {
-        unsafe { std::mem::transmute((self.current_side as u8) + 1 & 1) }
-    }
-
     pub fn piece_on(&self, square: usize) -> Option<Piece> {
         self.board[square]
-    }
-
-    fn piece_color(&self, square: usize) -> Color {
-        if self.state.colors[0] & (1 << square) != 0 {
-            Color::White
-        } else {
-            Color::Black
-        }
-    }
-
-    fn en_passant_possible(&self) -> bool {
-        self.state.p == PieceType::Pawn
-            && (self.state.m.from() as i32 - self.state.m.to() as i32).abs() == 16
-    }
-
-    fn piece_type(&self, square: usize) -> Option<PieceType> {
-        let square = u64x8::splat(square as u64);
-        let boards = u64x8::from_array([
-            self.state.pieces[0],
-            self.state.pieces[1],
-            self.state.pieces[2],
-            self.state.pieces[3],
-            self.state.pieces[4],
-            self.state.pieces[5],
-            0,
-            0,
-        ]);
-
-        let masks = boards & square;
-        let truth_mask = masks.simd_ne(u64x8::splat(0));
-        let maybe_index = truth_mask.first_set();
-
-        if let Some(index) = maybe_index {
-            Some(PieceType::from_usize(index))
-        } else {
-            None
-        }
     }
 
     pub fn make_move(&mut self, m: ChessMove) {
@@ -213,8 +88,6 @@ impl Position {
         let maybe_capture = self.piece_type(1 << to);
         self.state.captured_p = maybe_capture;
         if let Some(p) = maybe_capture {
-            assert_ne!(self.current_side, self.piece_color(to));
-
             self.state.pieces[p as usize] &= !(1 << to);
             self.state.colors[self.piece_color(to) as usize] &= !(1 << to);
         }
@@ -222,7 +95,6 @@ impl Position {
         if m.is_en_passant() {
             let offset = 1 - 2 * self.current_side as i32;
             let piece_color = self.opposite_side();
-            assert_ne!(piece_color, self.current_side);
 
             self.state.colors[piece_color as usize] &= !(1 << ((to as i32 + 8 * offset) as usize));
             self.state.pieces[PieceType::Pawn as usize] &=
@@ -237,7 +109,6 @@ impl Position {
             self.state.colors[color_idx] &= !(1 << rook_square);
 
             let rook_square = to + (2 * m.is_castle_queen() as usize) - 1;
-            assert!(1 << rook_square & self.all() == 0);
             // Place rook
             self.state.pieces[PieceType::Rook as usize] |= 1 << rook_square;
             self.state.colors[color_idx] |= 1 << rook_square;
@@ -256,35 +127,6 @@ impl Position {
     pub fn undo_move(&mut self, m: ChessMove) {
         self.state = self.prev_states.pop().unwrap();
         self.switch_side();
-    }
-
-    fn update_castling_rights(&mut self, m: ChessMove, moving_piece: PieceType) {
-        let c = self.current_side as usize;
-
-        if moving_piece == PieceType::King {
-            self.state.castling_rights[2 * c + 0] = false;
-            self.state.castling_rights[2 * c + 1] = false;
-        } else if moving_piece == PieceType::Rook {
-            match m.from() {
-                63 => self.state.castling_rights[0] = false,
-                56 => self.state.castling_rights[1] = false,
-                7 => self.state.castling_rights[2] = false,
-                0 => self.state.castling_rights[3] = false,
-                _ => {}
-            };
-        }
-
-        if let Some(p) = self.state.captured_p {
-            if p == PieceType::Rook {
-                match m.to() {
-                    63 => self.state.castling_rights[0] = false,
-                    56 => self.state.castling_rights[1] = false,
-                    7 => self.state.castling_rights[2] = false,
-                    0 => self.state.castling_rights[3] = false,
-                    _ => {}
-                };
-            }
-        }
     }
 
     pub fn generate_moves(&mut self, moves: &mut Vec<ChessMove>) {
@@ -306,9 +148,7 @@ impl Position {
             responses.truncate(0);
             generate_pseudo_legal(self, &mut responses);
 
-            if responses.iter().any(|r| r.to() == king_square) {
-                //println!("Rejected move");
-            } else {
+            if !responses.iter().any(|r| r.to() == king_square) {
                 legal_moves.push(*m);
             }
 
@@ -320,39 +160,6 @@ impl Position {
 
         self.state.colors = start_colors;
         self.state.pieces = start_pieces;
-    }
-
-    pub fn generate_checkers_mask(&self) -> BitBoard {
-        let c = self.opposite_side();
-        let king = self.king(self.current_side);
-        let king_square = king.trailing_zeros();
-        let occupied = self.all();
-
-        let rooks = self.rooks(c) | self.queen(c);
-        let king_ortho = attack_mask_rook(king_square, occupied);
-        let rook_checkers = rooks & king_ortho;
-
-        let bishops = self.bishops(c) | self.queen(c);
-        let king_diag = attack_mask_bishop(king_square, occupied);
-        let bishop_checkers = bishops & king_diag;
-
-        let knights = self.knights(c);
-        let possible_knight_squares = LUT::KNIGHT[king_square as usize];
-        let knight_checkers = possible_knight_squares & knights;
-
-        let pawns = self.pawns(c);
-
-        const NOT_FILE_A: u64 = !0x0101010101010101;
-        const NOT_FILE_H: u64 = !0x8080808080808080;
-        let pawn_checkers = if c == Color::White {
-            let possible_pawn_squares = ((king << 9) & NOT_FILE_A) | ((king << 7) & NOT_FILE_H);
-            pawns & possible_pawn_squares
-        } else {
-            let possible_pawn_squares = ((king >> 9) & NOT_FILE_H) | ((king >> 7) & NOT_FILE_A);
-            possible_pawn_squares & pawns
-        };
-
-        bishop_checkers | rook_checkers | knight_checkers | pawn_checkers
     }
 
     pub fn from_fen(fen_string: &str) -> Result<Position, String> {
@@ -414,7 +221,7 @@ impl Position {
             x += 1;
         }
 
-        let mut states = Vec::new();
+        let states = Vec::new();
         let state = State {
             pieces,
             colors,
@@ -422,6 +229,8 @@ impl Position {
             p: PieceType::Pawn,
             castling_rights: [true; 2 * NUM_COLORS],
             captured_p: None,
+            pinners: [0; NUM_COLORS],
+            king_blockers: [0; NUM_COLORS],
         };
 
         Ok(Position {
@@ -431,6 +240,7 @@ impl Position {
             prev_states: states,
         })
     }
+
     /// Updates the public api facing pieces to reflect the actual state of the board.
     pub fn recalculate_pieces_from_state(&mut self) {
         self.board = [None; 64];
@@ -449,6 +259,179 @@ impl Position {
                 t: piece_type,
             });
         }
+    }
+
+    fn update_castling_rights(&mut self, m: ChessMove, moving_piece: PieceType) {
+        let c = self.current_side as usize;
+
+        if moving_piece == PieceType::King {
+            self.state.castling_rights[2 * c + 0] = false;
+            self.state.castling_rights[2 * c + 1] = false;
+        } else if moving_piece == PieceType::Rook {
+            match m.from() {
+                63 => self.state.castling_rights[0] = false,
+                56 => self.state.castling_rights[1] = false,
+                7 => self.state.castling_rights[2] = false,
+                0 => self.state.castling_rights[3] = false,
+                _ => {}
+            };
+        }
+
+        if let Some(p) = self.state.captured_p {
+            if p == PieceType::Rook {
+                match m.to() {
+                    63 => self.state.castling_rights[0] = false,
+                    56 => self.state.castling_rights[1] = false,
+                    7 => self.state.castling_rights[2] = false,
+                    0 => self.state.castling_rights[3] = false,
+                    _ => {}
+                };
+            }
+        }
+    }
+
+    fn piece_color(&self, square: usize) -> Color {
+        if self.state.colors[0] & (1 << square) != 0 {
+            Color::White
+        } else {
+            Color::Black
+        }
+    }
+
+    fn en_passant_possible(&self) -> bool {
+        self.state.p == PieceType::Pawn
+            && (self.state.m.from() as i32 - self.state.m.to() as i32).abs() == 16
+    }
+
+    fn piece_type(&self, square: usize) -> Option<PieceType> {
+        let square = u64x8::splat(square as u64);
+        let boards = u64x8::from_array([
+            self.state.pieces[0],
+            self.state.pieces[1],
+            self.state.pieces[2],
+            self.state.pieces[3],
+            self.state.pieces[4],
+            self.state.pieces[5],
+            0,
+            0,
+        ]);
+
+        let masks = boards & square;
+        let truth_mask = masks.simd_ne(u64x8::splat(0));
+        let maybe_index = truth_mask.first_set();
+
+        if let Some(index) = maybe_index {
+            Some(PieceType::from_usize(index))
+        } else {
+            None
+        }
+    }
+
+    fn generate_pin_data(&mut self, c: Color) {
+        let king_bb = self.king(c);
+        let king_square = king_bb.trailing_zeros();
+        let c = c as usize;
+        let ec = (c + 1) & 1;
+
+        self.state.king_blockers[c] = 0;
+        self.state.pinners[ec] = 0;
+
+        let rooks = self.state.pieces[PieceType::Queen as usize]
+            | self.state.pieces[PieceType::Rook as usize];
+
+        let bishops = self.state.pieces[PieceType::Queen as usize]
+            | self.state.pieces[PieceType::Bishop as usize];
+
+        let ortho = attack_mask_rook(king_square, 0);
+        let diag = attack_mask_bishop(king_square, 0);
+        let mut possible_snipers = ((ortho & rooks) | (diag & bishops)) & self.state.colors[ec];
+
+        let occupied = self.all() ^ possible_snipers;
+
+        while possible_snipers != 0 {
+            let pos = possible_snipers.trailing_zeroes_with_reset();
+            let bb = between_bb(king_square as usize, pos as usize) & occupied;
+
+            if bb.count_ones() == 1 {
+                self.state.king_blockers[c] |= bb;
+                if bb & self.state.colors[c] != 0 {
+                    self.state.pinners[ec] |= 1 << pos;
+                }
+            }
+        }
+    }
+
+    fn generate_checkers_mask(&self) -> BitBoard {
+        let c = self.opposite_side();
+        let king = self.king(self.current_side);
+        let king_square = king.trailing_zeros();
+        let occupied = self.all();
+
+        let rooks = self.rooks(c) | self.queen(c);
+        let king_ortho = attack_mask_rook(king_square, occupied);
+        let rook_checkers = rooks & king_ortho;
+
+        let bishops = self.bishops(c) | self.queen(c);
+        let king_diag = attack_mask_bishop(king_square, occupied);
+        let bishop_checkers = bishops & king_diag;
+
+        let knights = self.knights(c);
+        let possible_knight_squares = LUT::KNIGHT[king_square as usize];
+        let knight_checkers = possible_knight_squares & knights;
+
+        let pawns = self.pawns(c);
+
+        const NOT_FILE_A: u64 = !0x0101010101010101;
+        const NOT_FILE_H: u64 = !0x8080808080808080;
+        let pawn_checkers = if c == Color::White {
+            let possible_pawn_squares = ((king << 9) & NOT_FILE_A) | ((king << 7) & NOT_FILE_H);
+            pawns & possible_pawn_squares
+        } else {
+            let possible_pawn_squares = ((king >> 9) & NOT_FILE_H) | ((king >> 7) & NOT_FILE_A);
+            possible_pawn_squares & pawns
+        };
+
+        bishop_checkers | rook_checkers | knight_checkers | pawn_checkers
+    }
+
+    fn king(&self, c: Color) -> BitBoard {
+        self.state.pieces[PieceType::King as usize] & self.state.colors[c as usize]
+    }
+
+    fn queen(&self, c: Color) -> BitBoard {
+        self.state.pieces[PieceType::Queen as usize] & self.state.colors[c as usize]
+    }
+
+    fn rooks(&self, c: Color) -> BitBoard {
+        self.state.pieces[PieceType::Rook as usize] & self.state.colors[c as usize]
+    }
+
+    fn bishops(&self, c: Color) -> BitBoard {
+        self.state.pieces[PieceType::Bishop as usize] & self.state.colors[c as usize]
+    }
+
+    fn knights(&self, c: Color) -> BitBoard {
+        self.state.pieces[PieceType::Knight as usize] & self.state.colors[c as usize]
+    }
+
+    fn pawns(&self, c: Color) -> BitBoard {
+        self.state.pieces[PieceType::Pawn as usize] & self.state.colors[c as usize]
+    }
+
+    fn all(&self) -> BitBoard {
+        self.state.colors[0] | self.state.colors[1]
+    }
+
+    fn color_mask(&self, c: Color) -> BitBoard {
+        self.state.colors[c as usize]
+    }
+
+    fn switch_side(&mut self) {
+        self.current_side = unsafe { std::mem::transmute((self.current_side as u8 + 1) & 1) }
+    }
+
+    fn opposite_side(&self) -> Color {
+        unsafe { std::mem::transmute((self.current_side as u8) + 1 & 1) }
     }
 }
 
@@ -481,16 +464,11 @@ trait BitBoardExtensions {
     #[allow(unused)]
     fn print(&self);
 
-    fn set(&mut self, x: u32, y: u32);
     fn bit_scan(self, forward: bool) -> u32;
     fn trailing_zeroes_with_reset(&mut self) -> u32;
 }
 
 impl BitBoardExtensions for BitBoard {
-    fn set(&mut self, x: u32, y: u32) {
-        *self |= 1 << (y * 8 + x);
-    }
-
     // "borrowed" from
     // https://www.chessprogramming.org/BitScan#GeneralizedBitscan
     fn bit_scan(mut self, reverse: bool) -> u32 {
@@ -522,6 +500,54 @@ impl BitBoardExtensions for BitBoard {
 
             println!("");
         }
+    }
+}
+
+impl ChessMove {
+    const FLAG_EN_PASSANT: u32 = 0b0101;
+
+    const FLAG_QUEEN_PROMO: u32 = 0b1011;
+    const FLAG_ROOK_PROMO: u32 = 0b1010;
+    const FLAG_BISHOP_PROMO: u32 = 0b1001;
+    const FLAG_KNIGHT_PROMO: u32 = 0b1000;
+
+    const FLAG_CASTLE_KING: u32 = 0b0010;
+    const FLAG_CASTLE_QUEEN: u32 = 0b0011;
+
+    pub fn to(self) -> u32 {
+        self.0 & 0x3f
+    }
+
+    pub fn from(self) -> u32 {
+        (self.0 >> 6) & 0x3f
+    }
+
+    fn flags(self) -> u32 {
+        self.0 >> 12
+    }
+
+    fn is_en_passant(self) -> bool {
+        self.flags() == ChessMove::FLAG_EN_PASSANT
+    }
+
+    fn is_promotion(self) -> bool {
+        self.0 & 0b1000_0000_0000_0000 != 0
+    }
+
+    fn is_castle_move(self) -> bool {
+        self.is_castle_king() || self.is_castle_queen()
+    }
+
+    fn is_castle_king(self) -> bool {
+        self.flags() == ChessMove::FLAG_CASTLE_KING
+    }
+
+    fn is_castle_queen(self) -> bool {
+        self.flags() == ChessMove::FLAG_CASTLE_QUEEN
+    }
+
+    fn promotion_piece(self) -> PieceType {
+        unsafe { std::mem::transmute((self.flags() - 7) as u8) }
     }
 }
 

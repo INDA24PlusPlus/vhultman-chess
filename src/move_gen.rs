@@ -1,20 +1,11 @@
 use crate::*;
 
 pub(crate) fn generate_pseudo_legal(pos: &Position, moves: &mut Vec<ChessMove>) {
-    assert!(pos.color_mask(pos.current_side) & pos.color_mask(pos.opposite_side()) == 0);
-    assert!(pos.opposite_side() != pos.current_side);
-    assert!((1 << pos.state.m.to()) & pos.color_mask(pos.opposite_side()) != 0);
-
     generate_rook_moves(pos, moves);
     generate_bishop_moves(pos, moves);
     generate_knight_moves(pos, moves);
 
     let en_passant_mask = pos.en_passant_possible().as_mask() & (1 << pos.state.m.to());
-
-    assert!(en_passant_mask & pos.color_mask(pos.current_side) == 0);
-    if en_passant_mask != 0 {
-        assert!(en_passant_mask & pos.state.pieces[PieceType::Pawn as usize] == en_passant_mask);
-    }
 
     if pos.current_side == Color::White {
         generate_pawn_moves::<true>(pos, moves, en_passant_mask);
@@ -77,15 +68,11 @@ pub fn compute_threat_mask(pos: &Position, color: Color) -> BitBoard {
     let king = pos.king(color);
     mask |= LUT::KING[king.trailing_zeros() as usize];
 
-    // Remove squares with our own pieces.
-    //mask &= !color_mask;
-
     mask
 }
 
 fn gen_castling_moves(pos: &Position, moves: &mut Vec<ChessMove>, movable_squares: BitBoard) {
     let c = pos.current_side as usize;
-    let ec = (c + 1) & 1;
 
     // Cannot castle if we are in check
     if pos.generate_checkers_mask().count_ones() != 0 {
