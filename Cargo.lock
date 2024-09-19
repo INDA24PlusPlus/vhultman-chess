@@ -3,5 +3,5 @@
 version = 3
 
 [[package]]
-name = "vhultman-chess"
+name = "chess_v2"
 version = "0.1.0"

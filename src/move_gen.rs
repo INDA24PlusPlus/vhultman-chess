@@ -1,198 +1,386 @@
-use crate::rank;
-use crate::BitBoard;
-use crate::BitBoardExtensions;
-use crate::Board;
-use crate::BoolMaskTrait;
-use crate::Color;
-use crate::PieceMove;
-use crate::PieceType;
-use crate::BOARD_SIZE;
-use crate::SQUARE_COUNT;
+use crate::*;
 
-const KING_LUT: [BitBoard; SQUARE_COUNT] = LUTs::gen_king_moves();
-const KNIGHT_LUT: [BitBoard; SQUARE_COUNT] = LUTs::gen_knight_moves();
-const RAY_LUT: [BitBoard; SQUARE_COUNT * 8] = LUTs::gen_rays();
+pub(crate) fn generate_pseudo_legal(pos: &Position, moves: &mut Vec<ChessMove>) {
+    assert!(pos.color_mask(pos.current_side) & pos.color_mask(pos.opposite_side()) == 0);
+    assert!(pos.opposite_side() != pos.current_side);
+    assert!((1 << pos.state.m.to()) & pos.color_mask(pos.opposite_side()) != 0);
 
-impl Board {
-    /// Populates 'moves' field with current legal moves based upon board state.
-    /// returns all bitboard with all squares that
-    pub(crate) fn gen_moves(&mut self) {
-        let en_passant_mask = self.en_passant_possible().as_mask() & (1 << self.prev_piece.pos);
+    generate_rook_moves(pos, moves);
+    generate_bishop_moves(pos, moves);
+    generate_knight_moves(pos, moves);
 
-        if self.current_turn == Color::White {
-            self.get_pawn_moves_white(en_passant_mask)
-        } else {
-            self.get_pawn_moves_black(en_passant_mask)
-        };
+    let en_passant_mask = pos.en_passant_possible().as_mask() & (1 << pos.state.m.to());
 
-        self.get_knight_moves();
-        self.get_king_moves();
-
-        // Queen moves are also generated in these.
-        self.get_rook_moves();
-        self.get_bishop_moves();
+    assert!(en_passant_mask & pos.color_mask(pos.current_side) == 0);
+    if en_passant_mask != 0 {
+        assert!(en_passant_mask & pos.state.pieces[PieceType::Pawn as usize] == en_passant_mask);
     }
 
-    /// Determine if en passant is possbile based upon previous move.
-    fn en_passant_possible(&self) -> bool {
-        if self.prev_piece.t == PieceType::Pawn {
-            let move_dist = (self.prev_move.start as i32 - self.prev_move.target as i32).abs();
-            return move_dist == 16;
-        }
-
-        false
+    if pos.current_side == Color::White {
+        generate_pawn_moves::<true>(pos, moves, en_passant_mask);
+    } else {
+        generate_pawn_moves::<false>(pos, moves, en_passant_mask);
     }
 
-    fn get_pawn_moves_black(&mut self, en_passant_mask: BitBoard) {
-        let color_mask = self.state.color[self.current_turn as usize];
-        let mut pawns = self.state.pieces[PieceType::Pawn as usize] & color_mask;
-        let occupied = self.state.piece_mask() & !color_mask;
+    let threat_mask = compute_threat_mask(pos, pos.opposite_side());
+    generate_king_moves(pos, moves, !threat_mask);
+}
 
-        while pawns != 0 {
-            let pos = pawns.trailing_zeroes_with_reset();
-            let bb = 1 << pos;
+fn generate_king_moves(pos: &Position, moves: &mut Vec<ChessMove>, movable_squares: BitBoard) {
+    let king = pos.king(pos.current_side);
+    let king_square = king.trailing_zeros();
 
-            // single push
-            let mut moves = (bb << 8) & !occupied;
+    let mut move_mask = LUT::KING[king_square as usize];
+    move_mask &= !pos.color_mask(pos.current_side);
+    move_mask &= movable_squares;
 
-            // double pushes
-            moves |= ((moves & rank(2)) << BOARD_SIZE) & !occupied;
-
-            // Handle captures
-            let normal_captures = (bb << 7 | bb << 9) & occupied;
-            let en_passant_targets = (bb >> 1 | bb << 1) & en_passant_mask & rank(4);
-            let en_passant_moves = (en_passant_targets << 8) & !occupied;
-
-            moves |= normal_captures | en_passant_moves;
-            moves &= !color_mask;
-
-            self.add_moves_from_mask(pos, moves);
-        }
+    while move_mask != 0 {
+        let to = move_mask.trailing_zeroes_with_reset();
+        moves.push(ChessMove::new(king_square, to, 0));
     }
 
-    fn get_pawn_moves_white(&mut self, en_passant_mask: BitBoard) {
-        let color_mask = self.state.color[self.current_turn as usize];
-        let mut pawns = self.state.pieces[PieceType::Pawn as usize] & color_mask;
-        let occupied = self.state.piece_mask();
+    gen_castling_moves(pos, moves, movable_squares);
+}
 
-        while pawns != 0 {
-            let pos = pawns.trailing_zeroes_with_reset();
-            let bb = 1 << pos;
+pub fn compute_threat_mask(pos: &Position, color: Color) -> BitBoard {
+    let mut mask = 0;
+    let occupied = pos.all();
 
-            // single push
-            let mut moves = (bb >> 8) & !occupied;
-
-            // double pushes
-            moves |= ((moves & rank(5)) >> BOARD_SIZE) & !occupied;
-
-            // Handle captures
-            let normal_captures = (bb >> 7 | bb >> 9) & occupied;
-            let en_passant_targets = (bb >> 1 | bb << 1) & en_passant_mask & rank(3);
-            let en_passant_moves = (en_passant_targets >> 8) & !occupied;
-
-            moves |= normal_captures | en_passant_moves;
-            moves &= !color_mask;
-
-            self.add_moves_from_mask(pos, moves);
-        }
+    let mut rooks = pos.rooks(color) | pos.queen(color);
+    while rooks != 0 {
+        let square = rooks.trailing_zeroes_with_reset();
+        mask |= attack_mask_rook(square, occupied);
     }
 
-    fn get_king_moves(&mut self) {
-        let color_mask = self.state.color[self.current_turn as usize];
-        let king = self.state.pieces[PieceType::King as usize] & color_mask;
-
-        let pos = king.trailing_zeros();
-
-        let mut moves = KING_LUT[pos as usize];
-        moves &= !color_mask;
-
-        self.add_moves_from_mask(pos, moves);
+    let mut bishops = pos.bishops(color) | pos.queen(color);
+    while bishops != 0 {
+        let square = bishops.trailing_zeroes_with_reset();
+        mask |= attack_mask_bishop(square, occupied);
     }
 
-    fn get_knight_moves(&mut self) {
-        let color_mask = self.state.color[self.current_turn as usize];
-        let mut knights = self.state.pieces[PieceType::Knight as usize] & color_mask;
-
-        while knights != 0 {
-            let pos = knights.trailing_zeroes_with_reset();
-            let moves = KNIGHT_LUT[pos as usize] & !color_mask;
-
-            self.add_moves_from_mask(pos, moves);
-        }
+    let mut knights = pos.knights(color);
+    while knights != 0 {
+        let square = knights.trailing_zeroes_with_reset();
+        mask |= LUT::KNIGHT[square as usize];
     }
 
-    /// Generates bishop + queen moves.
-    fn get_bishop_moves(&mut self) {
-        let color_mask = self.state.color[self.current_turn as usize];
-        let mut bishops = self.state.pieces[PieceType::Bishop as usize]
-            | self.state.pieces[PieceType::Queen as usize] & color_mask;
+    const NOT_FILE_A: u64 = !0x0101010101010101;
+    const NOT_FILE_H: u64 = !0x8080808080808080;
 
-        let occupied = self.state.piece_mask();
-
-        while bishops != 0 {
-            let pos = bishops.trailing_zeroes_with_reset();
-
-            let mut attacks = self.get_ray_attack(RayDir::NorthEast, pos, occupied);
-            attacks |= self.get_ray_attack(RayDir::NorthWest, pos, occupied);
-            attacks |= self.get_ray_attack(RayDir::SouthEast, pos, occupied);
-            attacks |= self.get_ray_attack(RayDir::SouthWest, pos, occupied);
-
-            attacks &= !color_mask;
-
-            self.add_moves_from_mask(pos, attacks);
-        }
+    let pawns = pos.pawns(color);
+    if color == Color::White {
+        mask |= ((pawns >> 9) & NOT_FILE_H) | ((pawns >> 7) & NOT_FILE_A);
+    } else {
+        mask |= ((pawns << 9) & NOT_FILE_A) | ((pawns << 7) & NOT_FILE_H);
     }
 
-    // https://www.chessprogramming.org/Classical_Approach
-    /// Generates rook + queen moves.
-    fn get_rook_moves(&mut self) {
-        let color_mask = self.state.color[self.current_turn as usize];
-        let mut rooks = self.state.pieces[PieceType::Rook as usize]
-            | self.state.pieces[PieceType::Queen as usize] & color_mask;
+    let king = pos.king(color);
+    mask |= LUT::KING[king.trailing_zeros() as usize];
 
-        let occupied = self.state.piece_mask();
+    // Remove squares with our own pieces.
+    //mask &= !color_mask;
 
-        while rooks != 0 {
-            let pos = rooks.trailing_zeroes_with_reset();
+    mask
+}
 
-            let mut attacks = self.get_ray_attack(RayDir::North, pos, occupied);
-            attacks |= self.get_ray_attack(RayDir::South, pos, occupied);
-            attacks |= self.get_ray_attack(RayDir::East, pos, occupied);
-            attacks |= self.get_ray_attack(RayDir::West, pos, occupied);
+fn gen_castling_moves(pos: &Position, moves: &mut Vec<ChessMove>, movable_squares: BitBoard) {
+    let c = pos.current_side as usize;
+    let ec = (c + 1) & 1;
 
-            attacks &= !color_mask;
-
-            self.add_moves_from_mask(pos, attacks);
-        }
+    // Cannot castle if we are in check
+    if pos.generate_checkers_mask().count_ones() != 0 {
+        return;
     }
 
-    fn get_ray_attack(&self, dir: RayDir, mut square: u32, occupied: BitBoard) -> BitBoard {
-        let mut attacks = RAY_LUT[square as usize * 8 + dir as usize];
-        let blocker = attacks & occupied;
-        if blocker != 0 {
-            square = 63 - blocker.bit_scan(!dir.is_negative());
-            attacks ^= RAY_LUT[square as usize * 8 + dir as usize];
-        }
+    let king = pos.king(pos.current_side);
+    let king_sq = king.trailing_zeros();
+    let occupied = pos.all() ^ pos.state.pieces[PieceType::Rook as usize];
 
-        attacks
+    let has_to_be_clear_king = if c == 0 {
+        between_bb(60, 63)
+    } else {
+        between_bb(4, 7)
+    };
+
+    let has_to_be_clear_queen = if c == 0 {
+        between_bb(60, 56)
+    } else {
+        between_bb(4, 0)
+    };
+
+    let king_between = if c == 0 {
+        between_bb(60, 62)
+    } else {
+        between_bb(4, 6)
+    };
+
+    let queen_between = if c == 0 {
+        between_bb(60, 58)
+    } else {
+        between_bb(4, 2)
+    };
+
+    let is_between_attacked = king_between & movable_squares == king_between;
+    let is_valid = king_between
+        & !occupied
+        & is_between_attacked.as_mask()
+        & (has_to_be_clear_king & !occupied == has_to_be_clear_king).as_mask()
+        == king_between;
+
+    if pos.state.castling_rights[2 * c + 0] && is_valid {
+        moves.push(ChessMove::new(
+            king_sq,
+            king_sq + 2,
+            ChessMove::FLAG_CASTLE_KING,
+        ));
     }
 
-    fn add_moves_from_mask(&mut self, start: u32, mut mask: BitBoard) {
-        while mask != 0 {
-            let pos = mask.trailing_zeroes_with_reset();
-            self.moves.push(PieceMove { start, target: pos });
+    let is_between_attacked = queen_between & movable_squares == queen_between;
+    let is_valid = queen_between
+        & !occupied
+        & is_between_attacked.as_mask()
+        & (has_to_be_clear_queen & !occupied == has_to_be_clear_queen).as_mask()
+        == queen_between;
+
+    if pos.state.castling_rights[2 * c + 1] && is_valid {
+        moves.push(ChessMove::new(
+            king_sq,
+            king_sq - 2,
+            ChessMove::FLAG_CASTLE_QUEEN,
+        ));
+    }
+}
+
+fn generate_knight_moves(pos: &Position, moves: &mut Vec<ChessMove>) {
+    let mut knights = pos.knights(pos.current_side);
+
+    while knights != 0 {
+        let from = knights.trailing_zeroes_with_reset();
+        let mut attacks = LUT::KNIGHT[from as usize];
+        attacks &= !pos.color_mask(pos.current_side);
+
+        while attacks != 0 {
+            let to = attacks.trailing_zeroes_with_reset();
+            moves.push(ChessMove::new(from, to, 0));
         }
     }
 }
 
-struct LUTs;
+fn generate_pawn_moves<const WHITE: bool>(
+    pos: &Position,
+    moves: &mut Vec<ChessMove>,
+    en_passant_mask: BitBoard,
+) {
+    let mut pawns = pos.pawns(pos.current_side);
+    let occupied = pos.all();
 
-impl LUTs {
-    const fn gen_king_moves<const N: usize>() -> [BitBoard; N] {
-        let mut moves = [0; N];
+    let double_push_rank = if WHITE { rank(5) } else { rank(2) };
+    let en_passant_rank = if WHITE { rank(3) } else { rank(4) };
+    let promotion_rank = if WHITE { rank(0) } else { rank(7) };
+
+    let right_capture_shift = if WHITE { 7 } else { 9 };
+    let left_capture_shift = if WHITE { 9 } else { 7 };
+
+    const NOT_FILE_A: u64 = !0x0101010101010101;
+    const NOT_FILE_H: u64 = !0x8080808080808080;
+
+    while pawns != 0 {
+        let from = pawns.trailing_zeroes_with_reset();
+        let bb = 1 << from;
+
+        // single push
+        let mut move_mask = shift::<WHITE>(bb, 8) & !occupied;
+
+        // double pushes
+        move_mask |= shift::<WHITE>(move_mask & double_push_rank, 8) & !occupied;
+
+        // Handle captures
+        let right_captures = shift::<WHITE>(bb, right_capture_shift) & NOT_FILE_A;
+        let left_captures = shift::<WHITE>(bb, left_capture_shift) & NOT_FILE_H;
+
+        let normal_captures = (right_captures | left_captures) & occupied;
+        move_mask |= normal_captures;
+        move_mask &= !pos.color_mask(pos.current_side);
+
+        // Handle promotions.
+        let mut promotion_moves = move_mask & promotion_rank;
+        move_mask &= !promotion_moves;
+
+        while promotion_moves != 0 {
+            let to = promotion_moves.trailing_zeroes_with_reset();
+            moves.push(ChessMove::new(from, to, ChessMove::FLAG_QUEEN_PROMO));
+            moves.push(ChessMove::new(from, to, ChessMove::FLAG_ROOK_PROMO));
+            moves.push(ChessMove::new(from, to, ChessMove::FLAG_BISHOP_PROMO));
+            moves.push(ChessMove::new(from, to, ChessMove::FLAG_KNIGHT_PROMO));
+        }
+
+        while move_mask != 0 {
+            let to = move_mask.trailing_zeroes_with_reset();
+            moves.push(ChessMove::new(from, to, 0));
+        }
+
+        // En passant
+        let en_passant_left = (bb >> 1) & NOT_FILE_H & en_passant_mask;
+        let en_passant_right = (bb << 1) & NOT_FILE_A & en_passant_mask;
+
+        let en_passant_targets = (en_passant_left | en_passant_right) & en_passant_rank;
+        let mut en_passant_moves = shift::<WHITE>(en_passant_targets, 8) & !occupied;
+
+        if en_passant_moves != 0 {
+            let to = en_passant_moves.trailing_zeroes_with_reset();
+            moves.push(ChessMove::new(from, to, ChessMove::FLAG_EN_PASSANT));
+        }
+    }
+}
+
+fn shift<const RIGHT: bool>(v: BitBoard, shift: u32) -> BitBoard {
+    if RIGHT {
+        v >> shift
+    } else {
+        v << shift
+    }
+}
+
+fn generate_bishop_moves(pos: &Position, moves: &mut Vec<ChessMove>) {
+    let mut bishops = pos.bishops(pos.current_side) | pos.queen(pos.current_side);
+    let occupied = pos.all();
+
+    while bishops != 0 {
+        let from = bishops.trailing_zeroes_with_reset();
+
+        let mut attacks = attack_mask_bishop(from, occupied);
+        attacks &= !pos.color_mask(pos.current_side);
+
+        while attacks != 0 {
+            let to = attacks.trailing_zeroes_with_reset();
+            moves.push(ChessMove::new(from, to, 0));
+        }
+    }
+}
+
+fn generate_rook_moves(pos: &Position, moves: &mut Vec<ChessMove>) {
+    let mut rooks = pos.rooks(pos.current_side) | pos.queen(pos.current_side);
+    let occupied = pos.all();
+
+    while rooks != 0 {
+        let from = rooks.trailing_zeroes_with_reset();
+
+        let mut attacks = attack_mask_rook(from, occupied);
+        attacks &= !pos.color_mask(pos.current_side);
+
+        while attacks != 0 {
+            let to = attacks.trailing_zeroes_with_reset();
+            moves.push(ChessMove::new(from, to, 0));
+        }
+    }
+}
+
+pub(crate) fn attack_mask_rook(square: u32, occupied: BitBoard) -> BitBoard {
+    let mut attacks = get_ray_attack(RayDir::North, square, occupied);
+    attacks |= get_ray_attack(RayDir::South, square, occupied);
+    attacks |= get_ray_attack(RayDir::East, square, occupied);
+    attacks |= get_ray_attack(RayDir::West, square, occupied);
+
+    attacks
+}
+
+pub(crate) fn attack_mask_bishop(square: u32, occupied: BitBoard) -> BitBoard {
+    let mut attacks = get_ray_attack(RayDir::NorthEast, square, occupied);
+    attacks |= get_ray_attack(RayDir::NorthWest, square, occupied);
+    attacks |= get_ray_attack(RayDir::SouthEast, square, occupied);
+    attacks |= get_ray_attack(RayDir::SouthWest, square, occupied);
+
+    attacks
+}
+
+fn get_ray_attack(dir: RayDir, mut square: u32, occupied: BitBoard) -> BitBoard {
+    let mut attacks = LUT::RAY[square as usize * 8 + dir as usize];
+    let blocker = attacks & occupied;
+    if blocker != 0 {
+        square = 63 - blocker.bit_scan(!dir.is_negative());
+        attacks ^= LUT::RAY[square as usize * 8 + dir as usize];
+    }
+
+    attacks
+}
+
+pub(crate) struct LUT;
+
+impl LUT {
+    const KING: [BitBoard; NUM_SQUARES] = LUT::gen_king_moves();
+    pub(crate) const KNIGHT: [BitBoard; NUM_SQUARES] = LUT::gen_knight_moves();
+    const RAY: [BitBoard; NUM_SQUARES * 8] = LUT::gen_rays();
+
+    // we might need this?
+    #[allow(long_running_const_eval)]
+    pub(crate) const BETWEEN_BBS: [BitBoard; NUM_SQUARES * NUM_SQUARES] = LUT::gen_between_bbs();
+
+    // This is runtime since it might take some time.
+    const fn gen_between_bbs() -> [BitBoard; NUM_SQUARES * NUM_SQUARES] {
+        let mut between_bb = [0; NUM_SQUARES * NUM_SQUARES];
+
+        let mut sq0: usize = 0;
+        while sq0 < NUM_SQUARES {
+            let x0 = sq0 & 7;
+            let y0 = sq0 / 8;
+
+            let mut sq1: usize = 0;
+            while sq1 < NUM_SQUARES {
+                let x1 = sq1 & 7;
+                let y1 = sq1 / 8;
+
+                let mut dx = x1 as i32 - x0 as i32;
+                let mut dy = y1 as i32 - y0 as i32;
+
+                if (dx != 0 && dy != 0) && dx.abs() != dy.abs() {
+                    sq1 += 1;
+                    continue;
+                }
+
+                if dx != 0 {
+                    let sign = dx.signum();
+                    dx /= dx;
+                    dx *= sign;
+                }
+
+                if dy != 0 {
+                    let sign = dy.signum();
+                    dy /= dy;
+                    dy *= sign;
+                }
+
+                let mut x = x0 as i32;
+                let mut y = y0 as i32;
+                let mut ray = 0;
+
+                loop {
+                    // hit edge, ray is finished.
+                    if x == x1 as i32 && y == y1 as i32 {
+                        break;
+                    }
+
+                    x += dx;
+                    y += dy;
+
+                    ray |= 1 << (y * 8 + x);
+                }
+
+                between_bb[sq0 * NUM_SQUARES + sq1] = ray;
+
+                sq1 += 1;
+            }
+
+            sq0 += 1;
+        }
+
+        between_bb
+    }
+
+    const fn gen_king_moves() -> [BitBoard; NUM_SQUARES] {
+        let mut moves = [0; NUM_SQUARES];
         let mut i = 0;
-        while i < N {
-            moves[i] = LUTs::king_moves(i as u32);
+        while i < NUM_SQUARES {
+            moves[i] = LUT::king_moves(i as u32);
             i += 1;
         }
 
@@ -214,8 +402,7 @@ impl LUTs {
                 bb << offset
             };
 
-            if target_square != 0
-                && LUTs::chebyshev_dist(square as i32, square as i32 + offset) == 1
+            if target_square != 0 && LUT::chebyshev_dist(square as i32, square as i32 + offset) == 1
             {
                 moves |= target_square;
             }
@@ -252,17 +439,17 @@ impl LUTs {
         let mut rays: [BitBoard; 8 * 8 * 8] = [0; 8 * 8 * 8];
 
         let mut square = 0;
-        while square < SQUARE_COUNT {
+        while square < 64 {
             let i = square * 8;
-            rays[i + RayDir::North as usize] = LUTs::gen_ray(square as i32, 0, -1);
-            rays[i + RayDir::NorthEast as usize] = LUTs::gen_ray(square as i32, 1, -1);
-            rays[i + RayDir::NorthWest as usize] = LUTs::gen_ray(square as i32, -1, -1);
-            rays[i + RayDir::East as usize] = LUTs::gen_ray(square as i32, 1, 0);
+            rays[i + RayDir::North as usize] = LUT::gen_ray(square as i32, 0, -1);
+            rays[i + RayDir::NorthEast as usize] = LUT::gen_ray(square as i32, 1, -1);
+            rays[i + RayDir::NorthWest as usize] = LUT::gen_ray(square as i32, -1, -1);
+            rays[i + RayDir::East as usize] = LUT::gen_ray(square as i32, 1, 0);
 
-            rays[i + RayDir::SouthEast as usize] = LUTs::gen_ray(square as i32, 1, 1);
-            rays[i + RayDir::South as usize] = LUTs::gen_ray(square as i32, 0, 1);
-            rays[i + RayDir::SouthWest as usize] = LUTs::gen_ray(square as i32, -1, 1);
-            rays[i + RayDir::West as usize] = LUTs::gen_ray(square as i32, -1, 0);
+            rays[i + RayDir::SouthEast as usize] = LUT::gen_ray(square as i32, 1, 1);
+            rays[i + RayDir::South as usize] = LUT::gen_ray(square as i32, 0, 1);
+            rays[i + RayDir::SouthWest as usize] = LUT::gen_ray(square as i32, -1, 1);
+            rays[i + RayDir::West as usize] = LUT::gen_ray(square as i32, -1, 0);
 
             square += 1;
         }
@@ -294,8 +481,8 @@ impl LUTs {
         let mut moves = [0; 8 * 8];
         let mut square = 0;
 
-        while square < SQUARE_COUNT {
-            moves[square] = LUTs::knight_moves_from_square(square as u32);
+        while square < 64 {
+            moves[square] = LUT::knight_moves_from_square(square as u32);
             square += 1;
         }
 
