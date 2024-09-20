@@ -114,6 +114,9 @@ impl Position {
         self.board[square]
     }
 
+    /// Makes a move on the board and switches to the other color.
+    /// It is assumed that the move is a valid move and is produced by the function
+    /// "generate_moves"
     pub fn make_move(&mut self, m: ChessMove) {
         self.prev_states.push(self.state);
         self.state.m = m;
@@ -168,67 +171,24 @@ impl Position {
         self.switch_side();
         self.generate_pin_data(self.current_side);
         self.state.checkers[self.opposite_side() as usize] = self.generate_checkers_mask();
+        self.recalculate_pieces_from_state();
     }
 
-    pub fn undo_move(&mut self, m: ChessMove) {
+    /// Reverts the previous move.
+    pub fn undo_move(&mut self, _: ChessMove) {
         self.state = self.prev_states.pop().unwrap();
         self.switch_side();
+        self.recalculate_pieces_from_state();
     }
 
-    fn generate_moves_perft(&mut self, moves: &mut Vec<ChessMove>) {
-        generate_pseudo_legal(self, moves);
-    }
-
+    /// Generates and fills "moves" with all legal moves for the current color.
+    /// returns what state the game is currently in (checkmate, stalemate etc)
     pub fn generate_moves(&mut self, moves: &mut Vec<ChessMove>) -> GameState {
         generate_pseudo_legal(self, moves);
         self.check_win_conditions(moves)
     }
 
-    pub fn check_win_conditions(&mut self, moves: &Vec<ChessMove>) -> GameState {
-        if moves.len() == 0 {
-            // Game is over
-            if self.state.checkers[self.opposite_side() as usize] == 0 {
-                return GameState::StaleMate;
-            } else {
-                return GameState::CheckMate;
-            }
-        }
-
-        if self.state.repetion_count == 3 {
-            return GameState::DrawByRepetion;
-        }
-
-        // Draw by insufficient material.
-        if self.state.pieces[PieceType::King as usize] == self.all() {
-            return GameState::DrawByInsufficientMaterial;
-        }
-
-        let num_white_pieces = self.color_mask(Color::White).count_ones();
-        let num_black_pieces = self.color_mask(Color::White).count_ones();
-
-        if num_white_pieces == 2 && num_black_pieces == 1 {
-            // Impossible to checkmate with just knight/bishop and king
-            if self.knights(Color::White) != 0 || self.bishops(Color::White) != 0 {
-                return GameState::DrawByInsufficientMaterial;
-            }
-        }
-
-        if num_black_pieces == 2 && num_white_pieces == 1 {
-            // Impossible to checkmate with just knight/bishop and king
-            if self.knights(Color::Black) != 0 || self.bishops(Color::Black) != 0 {
-                return GameState::DrawByInsufficientMaterial;
-            }
-        }
-
-        for s in self.prev_states.iter() {
-            if s.colors == self.state.colors && s.pieces == self.state.pieces {
-                self.state.repetion_count += 1;
-            }
-        }
-
-        GameState::Playing
-    }
-
+    /// Construct board state from FEN notation. Only supports piece positions right now.
     pub fn from_fen(fen_string: &str) -> Result<Position, String> {
         // Rank is reveresed here because the bitboard is top down.
         let mut x: usize = 0;
@@ -311,7 +271,7 @@ impl Position {
     }
 
     /// Updates the public api facing pieces to reflect the actual state of the board.
-    pub fn recalculate_pieces_from_state(&mut self) {
+    fn recalculate_pieces_from_state(&mut self) {
         self.board = [None; 64];
         let mut piece_mask = self.all();
 
@@ -328,6 +288,51 @@ impl Position {
                 t: piece_type,
             });
         }
+    }
+
+    fn check_win_conditions(&mut self, moves: &Vec<ChessMove>) -> GameState {
+        if moves.len() == 0 {
+            // Game is over
+            if self.state.checkers[self.opposite_side() as usize] == 0 {
+                return GameState::StaleMate;
+            } else {
+                return GameState::CheckMate;
+            }
+        }
+
+        if self.state.repetion_count == 3 {
+            return GameState::DrawByRepetion;
+        }
+
+        // Draw by insufficient material.
+        if self.state.pieces[PieceType::King as usize] == self.all() {
+            return GameState::DrawByInsufficientMaterial;
+        }
+
+        let num_white_pieces = self.color_mask(Color::White).count_ones();
+        let num_black_pieces = self.color_mask(Color::White).count_ones();
+
+        if num_white_pieces == 2 && num_black_pieces == 1 {
+            // Impossible to checkmate with just knight/bishop and king
+            if self.knights(Color::White) != 0 || self.bishops(Color::White) != 0 {
+                return GameState::DrawByInsufficientMaterial;
+            }
+        }
+
+        if num_black_pieces == 2 && num_white_pieces == 1 {
+            // Impossible to checkmate with just knight/bishop and king
+            if self.knights(Color::Black) != 0 || self.bishops(Color::Black) != 0 {
+                return GameState::DrawByInsufficientMaterial;
+            }
+        }
+
+        for s in self.prev_states.iter() {
+            if s.colors == self.state.colors && s.pieces == self.state.pieces {
+                self.state.repetion_count += 1;
+            }
+        }
+
+        GameState::Playing
     }
 
     fn update_castling_rights(&mut self, m: ChessMove, moving_piece: PieceType) {
@@ -643,7 +648,7 @@ fn perft_driver(pos: &mut Position, depth: u64) -> u64 {
     let mut moves = Vec::new();
 
     // generate moves
-    pos.generate_moves(&mut moves);
+    pos.generate_moves_perft(&mut moves);
 
     // loop over generated moves
     for m in moves.iter() {
@@ -655,31 +660,33 @@ fn perft_driver(pos: &mut Position, depth: u64) -> u64 {
     nodes
 }
 
-// perft test
+#[allow(unused)]
 fn perft_test(pos: &mut Position, depth: u64) -> u64 {
     // reset nodes count
     let mut nodes = 0;
     let mut moves = Vec::new();
 
     // generate moves
-    pos.generate_moves(&mut moves);
+    pos.generate_moves_perft(&mut moves);
 
     // loop over generated moves
     for m in moves {
         // make move
         pos.make_move(m);
-        // cummulative nodes
-        let cummulative_nodes = nodes;
 
         // call perft driver recursively
         nodes += perft_driver(pos, depth - 1);
-
-        // old nodes
-        let old_nodes = nodes - cummulative_nodes;
 
         // take back
         pos.undo_move(m);
     }
 
     nodes
+}
+
+impl Position {
+    #[allow(unused)]
+    fn generate_moves_perft(&mut self, moves: &mut Vec<ChessMove>) {
+        generate_pseudo_legal(self, moves);
+    }
 }
