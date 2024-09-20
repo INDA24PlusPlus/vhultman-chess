@@ -95,7 +95,7 @@ impl ChessMove {
 }
 
 pub struct Position {
-    board: [Option<Piece>; NUM_SQUARES],
+    pub board: [Option<Piece>; NUM_SQUARES],
     current_side: Color,
     move_list: Vec<ChessMove>,
 
@@ -179,6 +179,7 @@ impl Position {
             .collect()
     }
 
+    /// Returns any existing moves that start and end at the specified squares.
     pub fn get_move(&self, from: u32, to: u32) -> Option<ChessMove> {
         self.move_list
             .iter()
@@ -188,7 +189,7 @@ impl Position {
 
     /// Makes a move on the board and switches to the other color.
     /// It is assumed that the move is a valid move and is produced by the function
-    /// "generate_moves"
+    /// "get_move"
     pub fn make_move(&mut self, m: ChessMove) -> MoveFlag {
         self.make_move_internal(m);
         self.recalculate_pieces_from_state();
