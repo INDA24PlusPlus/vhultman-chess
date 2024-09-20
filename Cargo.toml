@@ -1,5 +1,5 @@
 [package]
-name = "vhultman_chess"
+name = "vhultman-chess"
 version = "0.1.0"
 edition = "2021"
 
