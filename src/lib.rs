@@ -116,6 +116,10 @@ impl Position {
         self.board[square]
     }
 
+    pub fn current_side(&self) -> Color {
+        self.current_side
+    }
+
     /// Makes a move on the board and switches to the other color.
     /// It is assumed that the move is a valid move and is produced by the function
     /// "generate_moves"
