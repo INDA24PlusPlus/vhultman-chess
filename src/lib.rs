@@ -12,6 +12,15 @@ const NUM_COLORS: usize = 2;
 
 type BitBoard = u64;
 
+#[derive(Clone, Copy, Debug)]
+pub enum GameState {
+    Playing,
+    CheckMate,
+    StaleMate,
+    DrawByRepetion,
+    DrawByInsufficientMaterial,
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Color {
     White,
@@ -44,6 +53,38 @@ impl ChessMove {
         // bits 6-0 (6 bits): to
         ChessMove((flags & 0xf) << 12 | ((from & 0x3f) << 6) | (to & 0x3f))
     }
+
+    pub fn to(self) -> u32 {
+        self.0 & 0x3f
+    }
+
+    pub fn from(self) -> u32 {
+        (self.0 >> 6) & 0x3f
+    }
+
+    pub fn is_en_passant(self) -> bool {
+        self.flags() == ChessMove::FLAG_EN_PASSANT
+    }
+
+    pub fn is_promotion(self) -> bool {
+        self.0 & 0b1000_0000_0000_0000 != 0
+    }
+
+    pub fn is_castle_move(self) -> bool {
+        self.is_castle_king() || self.is_castle_queen()
+    }
+
+    pub fn is_castle_king(self) -> bool {
+        self.flags() == ChessMove::FLAG_CASTLE_KING
+    }
+
+    pub fn is_castle_queen(self) -> bool {
+        self.flags() == ChessMove::FLAG_CASTLE_QUEEN
+    }
+
+    pub fn promotion_piece(self) -> PieceType {
+        unsafe { std::mem::transmute((self.flags() - 7) as u8) }
+    }
 }
 
 pub struct Position {
@@ -55,6 +96,7 @@ pub struct Position {
 
 #[derive(Clone, Copy)]
 struct State {
+    repetion_count: u32,
     pieces: [BitBoard; NUM_PIECE_TYPES],
     colors: [BitBoard; NUM_COLORS],
     castling_rights: [bool; 2 * NUM_COLORS],
@@ -133,8 +175,58 @@ impl Position {
         self.switch_side();
     }
 
-    pub fn generate_moves(&mut self, moves: &mut Vec<ChessMove>) {
+    fn generate_moves_perft(&mut self, moves: &mut Vec<ChessMove>) {
         generate_pseudo_legal(self, moves);
+    }
+
+    pub fn generate_moves(&mut self, moves: &mut Vec<ChessMove>) -> GameState {
+        generate_pseudo_legal(self, moves);
+        self.check_win_conditions(moves)
+    }
+
+    pub fn check_win_conditions(&mut self, moves: &Vec<ChessMove>) -> GameState {
+        if moves.len() == 0 {
+            // Game is over
+            if self.state.checkers[self.opposite_side() as usize] == 0 {
+                return GameState::StaleMate;
+            } else {
+                return GameState::CheckMate;
+            }
+        }
+
+        if self.state.repetion_count == 3 {
+            return GameState::DrawByRepetion;
+        }
+
+        // Draw by insufficient material.
+        if self.state.pieces[PieceType::King as usize] == self.all() {
+            return GameState::DrawByInsufficientMaterial;
+        }
+
+        let num_white_pieces = self.color_mask(Color::White).count_ones();
+        let num_black_pieces = self.color_mask(Color::White).count_ones();
+
+        if num_white_pieces == 2 && num_black_pieces == 1 {
+            // Impossible to checkmate with just knight/bishop and king
+            if self.knights(Color::White) != 0 || self.bishops(Color::White) != 0 {
+                return GameState::DrawByInsufficientMaterial;
+            }
+        }
+
+        if num_black_pieces == 2 && num_white_pieces == 1 {
+            // Impossible to checkmate with just knight/bishop and king
+            if self.knights(Color::Black) != 0 || self.bishops(Color::Black) != 0 {
+                return GameState::DrawByInsufficientMaterial;
+            }
+        }
+
+        for s in self.prev_states.iter() {
+            if s.colors == self.state.colors && s.pieces == self.state.pieces {
+                self.state.repetion_count += 1;
+            }
+        }
+
+        GameState::Playing
     }
 
     pub fn from_fen(fen_string: &str) -> Result<Position, String> {
@@ -200,6 +292,7 @@ impl Position {
         let state = State {
             pieces,
             colors,
+            repetion_count: 0,
             m: ChessMove::new(0, 0, 0),
             p: PieceType::Pawn,
             castling_rights: [true; 2 * NUM_COLORS],
@@ -496,40 +589,8 @@ impl ChessMove {
     const FLAG_CASTLE_KING: u32 = 0b0010;
     const FLAG_CASTLE_QUEEN: u32 = 0b0011;
 
-    pub fn to(self) -> u32 {
-        self.0 & 0x3f
-    }
-
-    pub fn from(self) -> u32 {
-        (self.0 >> 6) & 0x3f
-    }
-
     fn flags(self) -> u32 {
         self.0 >> 12
-    }
-
-    fn is_en_passant(self) -> bool {
-        self.flags() == ChessMove::FLAG_EN_PASSANT
-    }
-
-    fn is_promotion(self) -> bool {
-        self.0 & 0b1000_0000_0000_0000 != 0
-    }
-
-    fn is_castle_move(self) -> bool {
-        self.is_castle_king() || self.is_castle_queen()
-    }
-
-    fn is_castle_king(self) -> bool {
-        self.flags() == ChessMove::FLAG_CASTLE_KING
-    }
-
-    fn is_castle_queen(self) -> bool {
-        self.flags() == ChessMove::FLAG_CASTLE_QUEEN
-    }
-
-    fn promotion_piece(self) -> PieceType {
-        unsafe { std::mem::transmute((self.flags() - 7) as u8) }
     }
 }
 
@@ -539,4 +600,86 @@ const fn between_bb(sq0: usize, sq1: usize) -> BitBoard {
 
 const fn rank(index: u32) -> u64 {
     0xff << (8 * index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_perft_6() {
+        let fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR";
+
+        let mut pos = match Position::from_fen(fen) {
+            Ok(p) => p,
+            Err(e) => panic!("{}", e),
+        };
+
+        let nodes = perft_test(&mut pos, 6);
+        assert_eq!(nodes, 119060324);
+    }
+
+    #[test]
+    fn modified_perft_5() {
+        let fen = "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R";
+
+        let mut pos = match Position::from_fen(fen) {
+            Ok(p) => p,
+            Err(e) => panic!("{}", e),
+        };
+
+        let nodes = perft_test(&mut pos, 5);
+        assert_eq!(nodes, 193690690);
+    }
+}
+
+fn perft_driver(pos: &mut Position, depth: u64) -> u64 {
+    let mut nodes = 0;
+    // reccursion escape condition
+    if depth == 0 {
+        return 1;
+    }
+
+    let mut moves = Vec::new();
+
+    // generate moves
+    pos.generate_moves(&mut moves);
+
+    // loop over generated moves
+    for m in moves.iter() {
+        pos.make_move(*m);
+        nodes += perft_driver(pos, depth - 1);
+        pos.undo_move(*m);
+    }
+
+    nodes
+}
+
+// perft test
+fn perft_test(pos: &mut Position, depth: u64) -> u64 {
+    // reset nodes count
+    let mut nodes = 0;
+    let mut moves = Vec::new();
+
+    // generate moves
+    pos.generate_moves(&mut moves);
+
+    // loop over generated moves
+    for m in moves {
+        // make move
+        pos.make_move(m);
+        // cummulative nodes
+        let cummulative_nodes = nodes;
+
+        // call perft driver recursively
+        nodes += perft_driver(pos, depth - 1);
+
+        // old nodes
+        let old_nodes = nodes - cummulative_nodes;
+
+        // take back
+        pos.undo_move(m);
+    }
+
+    nodes
 }
