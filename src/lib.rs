@@ -110,6 +110,8 @@ struct State {
 }
 
 impl Position {
+    /// Square 0 is the top left square on the board (A8)
+    /// Square 1 is B8, etc
     pub fn piece_on(&self, square: usize) -> Option<Piece> {
         self.board[square]
     }
@@ -333,6 +335,7 @@ impl Position {
         for s in self.prev_states.iter() {
             if s.colors == self.state.colors && s.pieces == self.state.pieces {
                 self.state.repetion_count += 1;
+                break;
             }
         }
 
