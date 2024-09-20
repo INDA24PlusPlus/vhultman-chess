@@ -263,7 +263,7 @@ fn generate_pawn_moves<const WHITE: bool>(
             // To handle en passant discovery check we just play the move and check if the king is in check.
             let to = en_passant_moves.trailing_zeroes_with_reset();
             let m = ChessMove::new(from, to, ChessMove::FLAG_EN_PASSANT);
-            pos.make_move(m);
+            pos.make_move_internal(m);
 
             // Other side now so we check if we have any checkers.
             if pos.state.checkers[pos.current_side as usize] == 0 {

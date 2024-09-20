@@ -15,9 +15,9 @@ type BitBoard = u64;
 #[derive(Clone, Copy, Debug)]
 pub enum GameState {
     Playing,
-    CheckMate,
-    StaleMate,
-    DrawByRepetion,
+    Checkmate,
+    Stalemate,
+    DrawByRepetition,
     DrawByInsufficientMaterial,
 }
 
@@ -47,7 +47,7 @@ pub struct Piece {
 pub struct ChessMove(u32);
 
 impl ChessMove {
-    pub fn new(from: u32, to: u32, flags: u32) -> ChessMove {
+    fn new(from: u32, to: u32, flags: u32) -> ChessMove {
         // bits 16-12 (4 bits): flags
         // bits 12-6 (6 bits): from
         // bits 6-0 (6 bits): to
@@ -85,11 +85,20 @@ impl ChessMove {
     pub fn promotion_piece(self) -> PieceType {
         unsafe { std::mem::transmute((self.flags() - 7) as u8) }
     }
+
+    pub fn set_promotion_piece(&mut self, piece_type: PieceType) {
+        assert_ne!(piece_type, PieceType::King);
+        assert_ne!(piece_type, PieceType::Pawn);
+
+        *self = ChessMove::new(self.from(), self.to(), piece_type as u32 + 7);
+    }
 }
 
 pub struct Position {
     board: [Option<Piece>; NUM_SQUARES],
     current_side: Color,
+    move_list: Vec<ChessMove>,
+
     state: State,
     prev_states: Vec<State>,
 }
@@ -109,23 +118,92 @@ struct State {
     checkers: [BitBoard; NUM_COLORS],
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MoveFlag(u32);
+
+impl MoveFlag {
+    const QUIET: u32 = 0;
+    const CAPTURE: u32 = 1;
+    const PROMOTION: u32 = 2;
+    const CHECK: u32 = 4;
+    const CASTLE: u32 = 8;
+
+    pub fn capture(self) -> bool {
+        self.0 & MoveFlag::CAPTURE != 0
+    }
+
+    pub fn promotion(self) -> bool {
+        self.0 & MoveFlag::PROMOTION != 0
+    }
+
+    pub fn check(self) -> bool {
+        self.0 & MoveFlag::CHECK != 0
+    }
+
+    pub fn castle(self) -> bool {
+        self.0 & MoveFlag::CASTLE != 0
+    }
+
+    pub fn quiet(self) -> bool {
+        self.0 == MoveFlag::QUIET
+    }
+
+    fn new(capture: bool, promotion: bool, check: bool, castle: bool) -> MoveFlag {
+        MoveFlag(
+            capture as u32 | (promotion as u32) << 1 | (check as u32) << 2 | (castle as u32) << 3,
+        )
+    }
+}
+
 impl Position {
     /// Square 0 is the top left square on the board (A8)
     /// Square 1 is B8, etc
-    pub fn piece_on(&self, square: usize) -> Option<Piece> {
-        self.board[square]
+    pub fn piece_on(&self, square: u32) -> Option<Piece> {
+        self.board[square as usize]
     }
 
     pub fn current_side(&self) -> Color {
         self.current_side
     }
 
+    pub fn opposite_side(&self) -> Color {
+        unsafe { std::mem::transmute((self.current_side as u8) + 1 & 1) }
+    }
+
+    /// Returns all valid moves for the specified square.
+    pub fn moves_for_square(&self, square: u32) -> Vec<ChessMove> {
+        self.move_list
+            .iter()
+            .filter(|m| m.from() == square)
+            .cloned()
+            .collect()
+    }
+
+    pub fn get_move(&self, from: u32, to: u32) -> Option<ChessMove> {
+        self.move_list
+            .iter()
+            .find(|m| m.from() == from && m.to() == to)
+            .cloned()
+    }
+
     /// Makes a move on the board and switches to the other color.
     /// It is assumed that the move is a valid move and is produced by the function
     /// "generate_moves"
-    pub fn make_move(&mut self, m: ChessMove) {
+    pub fn make_move(&mut self, m: ChessMove) -> MoveFlag {
         self.make_move_internal(m);
         self.recalculate_pieces_from_state();
+        self.generate_moves();
+
+        if self.state.captured_p.is_some() {
+            return MoveFlag::new(
+                true,
+                m.is_promotion(),
+                self.state.checkers[self.opposite_side() as usize] != 0,
+                false,
+            );
+        }
+
+        MoveFlag::new(false, false, false, m.is_castle_move())
     }
 
     /// Reverts the previous move.
@@ -135,11 +213,50 @@ impl Position {
         self.recalculate_pieces_from_state();
     }
 
-    /// Generates and fills "moves" with all legal moves for the current color.
-    /// returns what state the game is currently in (checkmate, stalemate etc)
-    pub fn generate_moves(&mut self, moves: &mut Vec<ChessMove>) -> GameState {
-        generate_legal(self, moves);
-        self.check_win_conditions(moves)
+    pub fn check_game_state(&mut self) -> GameState {
+        if self.move_list.len() == 0 {
+            // Game is over
+            if self.state.checkers[self.opposite_side() as usize] == 0 {
+                return GameState::Stalemate;
+            } else {
+                return GameState::Checkmate;
+            }
+        }
+
+        if self.state.repetion_count == 3 {
+            return GameState::DrawByRepetition;
+        }
+
+        // Draw by insufficient material.
+        if self.state.pieces[PieceType::King as usize] == self.all() {
+            return GameState::DrawByInsufficientMaterial;
+        }
+
+        let num_white_pieces = self.color_mask(Color::White).count_ones();
+        let num_black_pieces = self.color_mask(Color::White).count_ones();
+
+        if num_white_pieces == 2 && num_black_pieces == 1 {
+            // Impossible to checkmate with just knight/bishop and king
+            if self.knights(Color::White) != 0 || self.bishops(Color::White) != 0 {
+                return GameState::DrawByInsufficientMaterial;
+            }
+        }
+
+        if num_black_pieces == 2 && num_white_pieces == 1 {
+            // Impossible to checkmate with just knight/bishop and king
+            if self.knights(Color::Black) != 0 || self.bishops(Color::Black) != 0 {
+                return GameState::DrawByInsufficientMaterial;
+            }
+        }
+
+        for s in self.prev_states.iter() {
+            if s.colors == self.state.colors && s.pieces == self.state.pieces {
+                self.state.repetion_count += 1;
+                break;
+            }
+        }
+
+        GameState::Playing
     }
 
     /// Construct board state from FEN notation. Only supports piece positions right now.
@@ -216,12 +333,26 @@ impl Position {
             checkers: [0; NUM_COLORS],
         };
 
-        Ok(Position {
+        let mut pos = Position {
             current_side: Color::White,
+            move_list: Vec::new(),
             state,
             board,
             prev_states: states,
-        })
+        };
+
+        pos.generate_moves();
+        pos.recalculate_pieces_from_state();
+
+        Ok(pos)
+    }
+
+    fn generate_moves(&mut self) {
+        let mut moves = Vec::new();
+        moves.reserve(256);
+
+        generate_legal(self, &mut moves);
+        self.move_list = moves;
     }
 
     fn make_move_internal(&mut self, m: ChessMove) {
@@ -298,52 +429,6 @@ impl Position {
                 t: piece_type,
             });
         }
-    }
-
-    fn check_win_conditions(&mut self, moves: &Vec<ChessMove>) -> GameState {
-        if moves.len() == 0 {
-            // Game is over
-            if self.state.checkers[self.opposite_side() as usize] == 0 {
-                return GameState::StaleMate;
-            } else {
-                return GameState::CheckMate;
-            }
-        }
-
-        if self.state.repetion_count == 3 {
-            return GameState::DrawByRepetion;
-        }
-
-        // Draw by insufficient material.
-        if self.state.pieces[PieceType::King as usize] == self.all() {
-            return GameState::DrawByInsufficientMaterial;
-        }
-
-        let num_white_pieces = self.color_mask(Color::White).count_ones();
-        let num_black_pieces = self.color_mask(Color::White).count_ones();
-
-        if num_white_pieces == 2 && num_black_pieces == 1 {
-            // Impossible to checkmate with just knight/bishop and king
-            if self.knights(Color::White) != 0 || self.bishops(Color::White) != 0 {
-                return GameState::DrawByInsufficientMaterial;
-            }
-        }
-
-        if num_black_pieces == 2 && num_white_pieces == 1 {
-            // Impossible to checkmate with just knight/bishop and king
-            if self.knights(Color::Black) != 0 || self.bishops(Color::Black) != 0 {
-                return GameState::DrawByInsufficientMaterial;
-            }
-        }
-
-        for s in self.prev_states.iter() {
-            if s.colors == self.state.colors && s.pieces == self.state.pieces {
-                self.state.repetion_count += 1;
-                break;
-            }
-        }
-
-        GameState::Playing
     }
 
     fn update_castling_rights(&mut self, m: ChessMove, moving_piece: PieceType) {
@@ -519,10 +604,6 @@ impl Position {
 
     fn switch_side(&mut self) {
         self.current_side = unsafe { std::mem::transmute((self.current_side as u8 + 1) & 1) }
-    }
-
-    fn opposite_side(&self) -> Color {
-        unsafe { std::mem::transmute((self.current_side as u8) + 1 & 1) }
     }
 }
 
