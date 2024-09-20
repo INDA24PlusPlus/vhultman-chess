@@ -4,7 +4,7 @@ use std::simd::u64x8;
 
 mod move_gen;
 
-use move_gen::{attack_mask_bishop, attack_mask_rook, generate_pseudo_legal, LUT};
+use move_gen::{attack_mask_bishop, attack_mask_rook, generate_legal, LUT};
 
 const NUM_PIECE_TYPES: usize = 6;
 const NUM_SQUARES: usize = 64;
@@ -118,59 +118,7 @@ impl Position {
     /// It is assumed that the move is a valid move and is produced by the function
     /// "generate_moves"
     pub fn make_move(&mut self, m: ChessMove) {
-        self.prev_states.push(self.state);
-        self.state.m = m;
-
-        let from = m.from() as usize;
-        let to = m.to() as usize;
-
-        let color_idx = self.current_side as usize;
-        let mut piece_type = self.piece_type(1 << from).unwrap();
-        self.state.p = piece_type;
-
-        self.state.pieces[piece_type as usize] &= !(1 << from);
-        self.state.colors[color_idx] &= !(1 << from);
-
-        let maybe_capture = self.piece_type(1 << to);
-        self.state.captured_p = maybe_capture;
-
-        if let Some(p) = maybe_capture {
-            self.state.pieces[p as usize] &= !(1 << to);
-            self.state.colors[self.piece_color(to) as usize] &= !(1 << to);
-        }
-
-        if m.is_en_passant() {
-            let offset = 1 - 2 * self.current_side as i32;
-            let piece_color = self.opposite_side();
-
-            self.state.colors[piece_color as usize] &= !(1 << ((to as i32 + 8 * offset) as usize));
-            self.state.pieces[PieceType::Pawn as usize] &=
-                !(1 << ((to as i32 + 8 * offset) as usize));
-        } else if m.is_castle_move() {
-            let offset = if m.is_castle_king() { 3 } else { -4 };
-
-            // Remove rook.
-            let rook_square = (from as i32 + offset) as usize;
-
-            self.state.pieces[PieceType::Rook as usize] &= !(1 << rook_square);
-            self.state.colors[color_idx] &= !(1 << rook_square);
-
-            let rook_square = to + (2 * m.is_castle_queen() as usize) - 1;
-            // Place rook
-            self.state.pieces[PieceType::Rook as usize] |= 1 << rook_square;
-            self.state.colors[color_idx] |= 1 << rook_square;
-        } else if m.is_promotion() {
-            piece_type = m.promotion_piece();
-        }
-
-        self.update_castling_rights(m, piece_type);
-
-        self.state.pieces[piece_type as usize] |= 1 << to;
-        self.state.colors[color_idx] |= 1 << to;
-
-        self.switch_side();
-        self.generate_pin_data(self.current_side);
-        self.state.checkers[self.opposite_side() as usize] = self.generate_checkers_mask();
+        self.make_move_internal(m);
         self.recalculate_pieces_from_state();
     }
 
@@ -184,7 +132,7 @@ impl Position {
     /// Generates and fills "moves" with all legal moves for the current color.
     /// returns what state the game is currently in (checkmate, stalemate etc)
     pub fn generate_moves(&mut self, moves: &mut Vec<ChessMove>) -> GameState {
-        generate_pseudo_legal(self, moves);
+        generate_legal(self, moves);
         self.check_win_conditions(moves)
     }
 
@@ -268,6 +216,62 @@ impl Position {
             board,
             prev_states: states,
         })
+    }
+
+    fn make_move_internal(&mut self, m: ChessMove) {
+        self.prev_states.push(self.state);
+        self.state.m = m;
+
+        let from = m.from() as usize;
+        let to = m.to() as usize;
+
+        let color_idx = self.current_side as usize;
+        let mut piece_type = self.piece_type(1 << from).unwrap();
+        self.state.p = piece_type;
+
+        self.state.pieces[piece_type as usize] &= !(1 << from);
+        self.state.colors[color_idx] &= !(1 << from);
+
+        let maybe_capture = self.piece_type(1 << to);
+        self.state.captured_p = maybe_capture;
+
+        if let Some(p) = maybe_capture {
+            self.state.pieces[p as usize] &= !(1 << to);
+            self.state.colors[self.piece_color(to) as usize] &= !(1 << to);
+        }
+
+        if m.is_en_passant() {
+            let offset = 1 - 2 * self.current_side as i32;
+            let piece_color = self.opposite_side();
+
+            self.state.colors[piece_color as usize] &= !(1 << ((to as i32 + 8 * offset) as usize));
+            self.state.pieces[PieceType::Pawn as usize] &=
+                !(1 << ((to as i32 + 8 * offset) as usize));
+        } else if m.is_castle_move() {
+            let offset = if m.is_castle_king() { 3 } else { -4 };
+
+            // Remove rook.
+            let rook_square = (from as i32 + offset) as usize;
+
+            self.state.pieces[PieceType::Rook as usize] &= !(1 << rook_square);
+            self.state.colors[color_idx] &= !(1 << rook_square);
+
+            let rook_square = to + (2 * m.is_castle_queen() as usize) - 1;
+            // Place rook
+            self.state.pieces[PieceType::Rook as usize] |= 1 << rook_square;
+            self.state.colors[color_idx] |= 1 << rook_square;
+        } else if m.is_promotion() {
+            piece_type = m.promotion_piece();
+        }
+
+        self.update_castling_rights(m, piece_type);
+
+        self.state.pieces[piece_type as usize] |= 1 << to;
+        self.state.colors[color_idx] |= 1 << to;
+
+        self.switch_side();
+        self.generate_pin_data(self.current_side);
+        self.state.checkers[self.opposite_side() as usize] = self.generate_checkers_mask();
     }
 
     /// Updates the public api facing pieces to reflect the actual state of the board.
@@ -648,13 +652,13 @@ fn perft_driver(pos: &mut Position, depth: u64) -> u64 {
     let mut moves = Vec::new();
 
     // generate moves
-    pos.generate_moves_perft(&mut moves);
+    generate_legal(pos, &mut moves);
 
     // loop over generated moves
     for m in moves.iter() {
-        pos.make_move(*m);
+        pos.make_move_internal(*m);
         nodes += perft_driver(pos, depth - 1);
-        pos.undo_move(*m);
+        pos.undo_move_perft(*m);
     }
 
     nodes
@@ -667,18 +671,18 @@ fn perft_test(pos: &mut Position, depth: u64) -> u64 {
     let mut moves = Vec::new();
 
     // generate moves
-    pos.generate_moves_perft(&mut moves);
+    generate_legal(pos, &mut moves);
 
     // loop over generated moves
     for m in moves {
         // make move
-        pos.make_move(m);
+        pos.make_move_internal(m);
 
         // call perft driver recursively
         nodes += perft_driver(pos, depth - 1);
 
         // take back
-        pos.undo_move(m);
+        pos.undo_move_perft(m);
     }
 
     nodes
@@ -686,7 +690,8 @@ fn perft_test(pos: &mut Position, depth: u64) -> u64 {
 
 impl Position {
     #[allow(unused)]
-    fn generate_moves_perft(&mut self, moves: &mut Vec<ChessMove>) {
-        generate_pseudo_legal(self, moves);
+    fn undo_move_perft(&mut self, _: ChessMove) {
+        self.state = self.prev_states.pop().unwrap();
+        self.switch_side();
     }
 }

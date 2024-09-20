@@ -1,6 +1,6 @@
 use crate::*;
 
-pub(crate) fn generate_pseudo_legal(pos: &mut Position, moves: &mut Vec<ChessMove>) {
+pub(crate) fn generate_legal(pos: &mut Position, moves: &mut Vec<ChessMove>) {
     let checkers_mask = pos.state.checkers[pos.opposite_side() as usize];
     let checkers_count = checkers_mask.count_ones();
 
